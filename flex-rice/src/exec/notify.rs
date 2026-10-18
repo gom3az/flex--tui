@@ -724,11 +724,15 @@ pub fn open_application(app_name: &str) {
 }
 
 /// Do Not Disturb state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DndState {
+    #[default]
     Off,
     Indefinite,
-    Timed { until: u64, total_secs: u64 },
+    Timed {
+        until: u64,
+        total_secs: u64,
+    },
 }
 
 impl DndState {
@@ -785,31 +789,13 @@ pub struct PeripheralDevice {
 }
 
 /// Quick controls shelf snapshot.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct QuickControls {
     pub dnd: DndState,
-    pub night_light: bool,
-    pub caffeine: bool,
-    pub mic_muted: bool,
     pub wifi_ssid: Option<String>,
     pub bluetooth_status: Option<String>,
     pub peripherals: Vec<PeripheralDevice>,
     pub mpris: Option<MprisTrack>,
-}
-
-impl Default for QuickControls {
-    fn default() -> Self {
-        Self {
-            dnd: DndState::Off,
-            night_light: false,
-            caffeine: false,
-            mic_muted: false,
-            wifi_ssid: None,
-            bluetooth_status: None,
-            peripherals: Vec::new(),
-            mpris: None,
-        }
-    }
 }
 
 /// Parse a raw metadata line formatted by `playerctl`.
@@ -905,19 +891,9 @@ pub fn probe_mpris() -> Option<MprisTrack> {
     parse_mpris_line(first_line)
 }
 
-/// Query `wpctl` to determine if the default microphone is muted.
-#[must_use]
-pub fn probe_mic_muted() -> bool {
-    std::process::Command::new("wpctl")
-        .args(["get-volume", "@DEFAULT_AUDIO_SOURCE@"])
-        .output()
-        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("[MUTED]"))
-}
-
-/// Update hardware & MPRIS statuses in `QuickControls` while preserving active DND state.
+/// Update MPRIS status in `QuickControls` while preserving active DND state.
 pub fn probe_quick_controls(controls: &mut QuickControls) {
     controls.mpris = probe_mpris();
-    controls.mic_muted = probe_mic_muted();
 }
 
 /// Complete runtime state stored in `$XDG_RUNTIME_DIR/flex-notify.json`.
@@ -1648,14 +1624,14 @@ mod tests {
             "Message body",
             Urgency::Normal,
         ));
-        state.controls.night_light = true;
+        state.controls.dnd = DndState::Indefinite;
 
         save_state(&state, Some(&path)).expect("saved");
         let loaded = load_state(Some(&path));
 
         assert_eq!(loaded.notifications.len(), 1);
         assert_eq!(loaded.notifications[0].app_name, "Discord");
-        assert!(loaded.controls.night_light);
+        assert_eq!(loaded.controls.dnd, DndState::Indefinite);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

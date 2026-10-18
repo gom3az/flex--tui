@@ -107,15 +107,7 @@ pub fn tick_hook(menu: &mut Menu) {
         bt::refresh(menu);
     }
     if menu.provider == notify::PROVIDER
-        && active_tab_is(
-            menu,
-            &[
-                notify::TAB_FEED,
-                notify::TAB_CHANNELS,
-                notify::TAB_FOCUS,
-                notify::TAB_HISTORY,
-            ],
-        )
+        && active_tab_is(menu, &[notify::TAB_FEED, notify::TAB_HISTORY])
         && throttle_due("notify", Duration::from_secs(2))
     {
         notify::refresh(menu);
@@ -186,11 +178,15 @@ pub(crate) fn restore_focus(menu: &mut Menu, previous: Option<RowId>) {
 }
 
 /// In-place row sync (OPT-9): when `current` and `fresh` share the same ids
-/// in order, rewrite only changed `label`/`meta`/`volume`/`offline`/
-/// `is_default` fields so existing `Row`/`String` allocations (and stable
-/// ids/targets) survive the tick; otherwise fall back to wholesale replace
-/// via `mem::replace`. Row count/order changes (new/dead pids) take the
-/// fallback path.
+/// in order, rewrite only changed fields so existing `Row`/`String`
+/// allocations (and stable ids/targets) survive the tick; otherwise fall back
+/// to wholesale replace via `mem::replace`. Row count/order changes (new/dead
+/// pids) take the fallback path.
+///
+/// Every semantic field is covered (`PartialEq` minus the lazy `text_cache`,
+/// which refreshes itself on read): a same-shape tick is indistinguishable
+/// from a replace, so providers may toggle flags like `hide_target_in_header`
+/// or `confirmable` between ticks without an id change.
 pub(crate) fn sync_rows_in_place(current: &mut Vec<Row>, fresh: Vec<Row>) {
     let same_shape = current.len() == fresh.len()
         && current
@@ -208,8 +204,20 @@ pub(crate) fn sync_rows_in_place(current: &mut Vec<Row>, fresh: Vec<Row>) {
         if old.meta != new.meta {
             old.meta = new.meta;
         }
+        if old.confirmable != new.confirmable {
+            old.confirmable = new.confirmable;
+        }
         if old.volume != new.volume {
             old.volume = new.volume;
+        }
+        if old.muted != new.muted {
+            old.muted = new.muted;
+        }
+        if old.peaks != new.peaks {
+            old.peaks = new.peaks;
+        }
+        if old.config != new.config {
+            old.config = new.config;
         }
         if old.offline != new.offline {
             old.offline = new.offline;
@@ -229,5 +237,57 @@ pub(crate) fn sync_rows_in_place(current: &mut Vec<Row>, fresh: Vec<Row>) {
         if old.target_index != new.target_index {
             old.target_index = new.target_index;
         }
+        if old.preview_image != new.preview_image {
+            old.preview_image = new.preview_image;
+        }
+        if old.hide_target_in_header != new.hide_target_in_header {
+            old.hide_target_in_header = new.hide_target_in_header;
+        }
+        if old.compact != new.compact {
+            old.compact = new.compact;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Same-shape ticks must propagate every semantic flag, not just the
+    /// originally-covered subset: a provider that toggles e.g.
+    /// `hide_target_in_header` between ticks without an id change must see
+    /// it on screen (previously it stayed stale until an id reorder forced
+    /// the replace fallback).
+    #[test]
+    fn sync_rows_in_place_propagates_every_flag() {
+        let mut current = vec![
+            Row::new(RowId::new("a"), "a"),
+            Row::new(RowId::new("b"), "b"),
+        ];
+        let mut fresh_a = Row::with_meta(RowId::new("a"), "a2", "m");
+        fresh_a.confirmable = true;
+        fresh_a.muted = true;
+        fresh_a.peaks = Some(flex_core::RowPeaks::Mono(0.5));
+        fresh_a.config = Some(String::from("cfg"));
+        fresh_a.preview_image = Some(String::from("/tmp/x.png"));
+        fresh_a.hide_target_in_header = true;
+        fresh_a.compact = true;
+        let fresh = vec![fresh_a, Row::new(RowId::new("b"), "b")];
+
+        super::sync_rows_in_place(&mut current, fresh.clone());
+
+        assert_eq!(current, fresh, "same-shape sync must equal a replace");
+    }
+
+    /// Shape changes still take the wholesale-replace path.
+    #[test]
+    fn sync_rows_in_place_replaces_on_shape_change() {
+        let mut current = vec![Row::new(RowId::new("a"), "a")];
+        let fresh = vec![
+            Row::new(RowId::new("a"), "a"),
+            Row::new(RowId::new("b"), "b"),
+        ];
+        super::sync_rows_in_place(&mut current, fresh.clone());
+        assert_eq!(current, fresh);
     }
 }

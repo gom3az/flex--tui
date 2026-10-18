@@ -1,11 +1,11 @@
 //! Notification Center Drawer provider (`flex-notify`).
 //!
 //! Renders a native, search-free right-side drawer dashboard containing:
-//! - Quick Controls shelf (DND toggle & presets, Clear All, Night Light, Caffeine, Mic Mute)
+//! - Quick Controls shelf (DND toggle & Focus presets, Clear All)
 //! - MPRIS media player card with progress bar
 //! - Sticky critical system alerts
 //! - In-flight download/upgrade progress trackers
-//! - Expandable app and channel thread stacks
+//! - Expandable app thread stacks
 //! - Smart entity extractors (1-click copy OTP, URLs, hex colors)
 //! - Per-app mute rules and Focus/DND timers
 
@@ -52,9 +52,7 @@ pub fn is_thread_expanded(app: &str) -> bool {
 pub const PROVIDER: &str = "notify";
 
 /// Tab titles
-pub const TAB_FEED: &str = "Feed";
-pub const TAB_CHANNELS: &str = "Channels";
-pub const TAB_FOCUS: &str = "Focus/DND";
+pub const TAB_FEED: &str = "Notifications";
 pub const TAB_HISTORY: &str = "History";
 
 /// Action IDs for quick controls
@@ -62,9 +60,6 @@ pub const ACTION_QUICK_CONTROLS: &str = "quick:controls";
 pub const ACTION_MPRIS_TRACK: &str = "mpris:track";
 pub const ACTION_CLEAR_ALL: &str = "action:clear_all";
 pub const ACTION_TOGGLE_DND: &str = "action:toggle_dnd";
-pub const ACTION_TOGGLE_NIGHT: &str = "action:toggle_night";
-pub const ACTION_TOGGLE_CAFFEINE: &str = "action:toggle_caffeine";
-pub const ACTION_TOGGLE_MIC: &str = "action:toggle_mic";
 
 /// Current unix timestamp in seconds.
 fn now_secs() -> u64 {
@@ -507,38 +502,14 @@ pub fn feed_tab_from(state: &NotifyState, now: u64) -> Tab {
 
     let quick_targets = vec![
         Target::new(RowId::new("toggle_dnd"), format!("Toggle {dnd_label}")),
+        Target::new(RowId::new("dnd:25m"), "Pomodoro Sprint (25 Mins)"),
+        Target::new(RowId::new("dnd:60m"), "Deep Work (1 Hour)"),
+        Target::new(RowId::new("dnd:120m"), "Focus Session (2 Hours)"),
+        Target::new(RowId::new("dnd:indefinite"), "Silence Until Turned Off"),
+        Target::new(RowId::new("dnd:off"), "Turn DND Off"),
         Target::new(
             RowId::new("clear_all"),
             format!("Clear All ({active_count} Active)"),
-        ),
-        Target::new(
-            RowId::new("toggle_night"),
-            format!(
-                "Night Light: {}",
-                if state.controls.night_light {
-                    "On"
-                } else {
-                    "Off"
-                }
-            ),
-        ),
-        Target::new(
-            RowId::new("toggle_caffeine"),
-            format!(
-                "Caffeine: {}",
-                if state.controls.caffeine { "On" } else { "Off" }
-            ),
-        ),
-        Target::new(
-            RowId::new("toggle_mic"),
-            format!(
-                "Microphone: {}",
-                if state.controls.mic_muted {
-                    "Muted"
-                } else {
-                    "Active"
-                }
-            ),
         ),
     ];
     let mut quick_row = Row::with_targets(
@@ -547,10 +518,11 @@ pub fn feed_tab_from(state: &NotifyState, now: u64) -> Tab {
         quick_targets,
         0,
     );
-    quick_row.sublabel = Some(format!(
-        "󰂛 {dnd_label}  •  󰅖 Clear ({active_count})  •  󰖔 Night  •  󰤄 Caffe"
-    ));
+    quick_row.sublabel = Some(format!("󰂛 {dnd_label}  •  󰅖 Clear ({active_count})"));
     quick_row.meta = Some(format!("{active_count} Active"));
+    if let Some(frac) = state.controls.dnd.fraction_remaining(now) {
+        quick_row.volume = Some(frac);
+    }
     quick_row.hide_target_in_header = true;
     rows.push(quick_row);
 
@@ -689,174 +661,6 @@ pub fn feed_tab_from(state: &NotifyState, now: u64) -> Tab {
     tab
 }
 
-/// Construct the `[Channels]` tab.
-#[must_use]
-pub fn channels_tab_from(state: &NotifyState, now: u64) -> Tab {
-    let mut rows = Vec::new();
-
-    let mut apps: Vec<&str> = state
-        .notifications
-        .iter()
-        .map(|n| n.app_name.as_str())
-        .collect();
-    apps.sort_unstable();
-    apps.dedup();
-
-    let mut app_channels: Vec<(&str, Vec<&NotificationItem>, u64)> = Vec::new();
-    for app in apps {
-        let mut active_items: Vec<&NotificationItem> = state
-            .notifications
-            .iter()
-            .filter(|n| n.app_name == app && !n.is_dismissed)
-            .collect();
-        active_items.sort_by_key(|n| std::cmp::Reverse(n.timestamp));
-        let max_ts = active_items.iter().map(|n| n.timestamp).max().unwrap_or(0);
-        app_channels.push((app, active_items, max_ts));
-    }
-    app_channels.sort_by_key(|(_, _, max_ts)| std::cmp::Reverse(*max_ts));
-
-    for (app, active_items, _max_ts) in app_channels {
-        let count = active_items.len();
-        let latest = active_items.first().copied();
-
-        let meta = latest.map_or_else(
-            || String::from("idle"),
-            |l| cached_rel_time(l.timestamp, now),
-        );
-
-        let expanded = is_thread_expanded(app);
-        let mut targets = Vec::new();
-
-        if count > 1 {
-            let toggle_title = if expanded {
-                String::from("Collapse Channel")
-            } else {
-                format!("Expand Channel ({count} active)")
-            };
-            targets.push(Target::new(
-                RowId::new(format!("toggle_thread:{app}")),
-                toggle_title,
-            ));
-        }
-
-        targets.push(Target::new(
-            RowId::new(format!("dismiss_app:{app}")),
-            format!("Dismiss All ({count})"),
-        ));
-        targets.push(Target::new(
-            RowId::new(format!("mute_app:{app}")),
-            format!("Mute {app} for 1h"),
-        ));
-        targets.push(Target::new(
-            RowId::new(format!("priority_app:{app}")),
-            format!("Toggle Priority for {app}"),
-        ));
-
-        let glyph_prefix = if count > 1 {
-            if expanded {
-                "▼ "
-            } else {
-                "▶ "
-            }
-        } else {
-            ""
-        };
-
-        let label = if count == 0 {
-            format!("{app} (idle)")
-        } else {
-            format!("{glyph_prefix}{app} ({count} active)")
-        };
-
-        let mut header_row =
-            Row::with_targets(RowId::new(format!("channel:{app}")), label, targets, 0);
-        header_row.meta = Some(meta);
-        rows.push(header_row);
-
-        if count == 1 {
-            rows.push(notification_row_from(active_items[0], now, true));
-        } else if count > 1 && expanded {
-            for (i, item) in active_items.iter().enumerate() {
-                let is_last = i + 1 == count;
-                rows.push(child_notification_row_from(item, now, is_last));
-            }
-        }
-    }
-
-    if rows.is_empty() {
-        rows.push(Row::new(RowId::new("empty:channels"), "No App Channels"));
-    }
-
-    let mut tab = Tab::with_rows(TAB_CHANNELS, rows);
-    tab.bare_rows = false;
-    tab.filterable = false;
-    tab.deletable = true;
-    tab
-}
-
-/// Construct the `[Focus/DND]` tab.
-#[must_use]
-pub fn focus_tab_from(state: &NotifyState, now: u64) -> Tab {
-    let mut rows = Vec::new();
-
-    let dnd_status_label = match state.controls.dnd {
-        DndState::Off => "Do Not Disturb: Inactive",
-        DndState::Indefinite => "Do Not Disturb: Active (Indefinite)",
-        DndState::Timed { until, .. } => {
-            let rem = until.saturating_sub(now);
-            if rem > 0 {
-                "Do Not Disturb: Active (Timer Running)"
-            } else {
-                "Do Not Disturb: Timer Expired"
-            }
-        }
-    };
-
-    let targets = vec![
-        Target::new(RowId::new("dnd:off"), "Turn DND Off"),
-        Target::new(RowId::new("dnd:25m"), "Pomodoro Sprint (25 Mins)"),
-        Target::new(RowId::new("dnd:60m"), "Deep Work (1 Hour)"),
-        Target::new(RowId::new("dnd:120m"), "Focus Session (2 Hours)"),
-        Target::new(RowId::new("dnd:indefinite"), "Silence Until Turned Off"),
-    ];
-
-    let mut status_row =
-        Row::with_targets(RowId::new("focus:status"), dnd_status_label, targets, 0);
-    if let Some(frac) = state.controls.dnd.fraction_remaining(now) {
-        status_row.volume = Some(frac);
-    }
-    rows.push(status_row);
-
-    let mut p1 = Row::with_meta(
-        RowId::new("preset:pomodoro"),
-        "Pomodoro Sprint (25m)",
-        "25 Mins",
-    );
-    p1.volume = Some(1.0);
-    rows.push(p1);
-
-    let mut p2 = Row::with_meta(
-        RowId::new("preset:deepwork"),
-        "Deep Work Session (1h)",
-        "60 Mins",
-    );
-    p2.volume = Some(1.0);
-    rows.push(p2);
-
-    let p3 = Row::with_meta(
-        RowId::new("preset:gaming"),
-        "Gaming Mode (Mute All Except Critical)",
-        "Auto",
-    );
-    rows.push(p3);
-
-    let mut tab = Tab::with_rows(TAB_FOCUS, rows);
-    tab.bare_rows = false;
-    tab.filterable = false;
-    tab.deletable = true;
-    tab
-}
-
 /// Construct the `[History]` tab.
 #[must_use]
 pub fn history_tab_from(state: &NotifyState, now: u64) -> Tab {
@@ -918,15 +722,10 @@ pub fn history_tab_from(state: &NotifyState, now: u64) -> Tab {
     tab
 }
 
-/// Build the full 4-tab Notification Center menu.
+/// Build the 2-tab Notification Center menu (`Notifications`, `History`).
 #[must_use]
 pub fn menu_from(state: &NotifyState, now: u64) -> Menu {
-    let tabs = vec![
-        feed_tab_from(state, now),
-        channels_tab_from(state, now),
-        focus_tab_from(state, now),
-        history_tab_from(state, now),
-    ];
+    let tabs = vec![feed_tab_from(state, now), history_tab_from(state, now)];
     crate::menu(PROVIDER, tabs)
 }
 
@@ -1058,14 +857,6 @@ pub fn execute(
         should_close = true;
     } else if let Some(info) = action_id.strip_prefix("copy_media:") {
         copy_to_clipboard(info);
-    } else if action_id == "toggle_mic" || action_id == ACTION_TOGGLE_MIC {
-        let _ = std::process::Command::new("wpctl")
-            .args(["set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle"])
-            .status();
-    } else if action_id == "toggle_night" || action_id == ACTION_TOGGLE_NIGHT {
-        let _ = std::process::Command::new("pkill")
-            .args(["-SIGUSR1", "hyprsunset"])
-            .status();
     } else if let Some(id_str) = action_id.strip_prefix("dismiss:") {
         if let Ok(id) = id_str.parse::<u32>() {
             if let Some(n) = state.notifications.iter_mut().find(|n| n.id == id) {
@@ -1184,6 +975,11 @@ pub fn execute(
         state.controls.dnd = DndState::Timed {
             until: now + 60 * 60,
             total_secs: 60 * 60,
+        };
+    } else if action_id == "dnd:120m" || target_title.contains("Focus Session") {
+        state.controls.dnd = DndState::Timed {
+            until: now + 120 * 60,
+            total_secs: 120 * 60,
         };
     } else if action_id == "dnd:off" || target_title.contains("DND Off") {
         state.controls.dnd = DndState::Off;
