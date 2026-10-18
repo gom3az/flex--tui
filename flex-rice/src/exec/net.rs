@@ -1,14 +1,28 @@
 //! `net` executor: high-performance network throughput monitor & process bandwidth tracker.
 //!
 //! Provides kernel statistics parsing for Waybar (`custom/net-speed`), Top Bandwidth Consumers
-//! ("Top Talkers"), and interface details. Throughput is computed from kernel statistics
-//! (`/proc/net/route`, `/sys/class/net/<iface>/statistics/`, `/proc/net/dev`, and `/proc/<pid>/io`)
-//! against a lightweight timestamped stat cache.
+//! ("Top Talkers"), and interface details. Interface throughput comes from kernel counters
+//! (`/proc/net/route`, `/sys/class/net/<iface>/statistics/`, `/proc/net/dev`); per-process
+//! rates come from per-connection TCP accounting (`ss -tinp` `bytes_sent`/`bytes_received`
+//! deltas attributed to pids). Socket counters exclude the local IPC (pipes, pty, Wayland)
+//! that `/proc/<pid>/io` `rchar`/`wchar` counts — measured live: `waybar` alone reads
+//! ~500 KB/s through pipes while the wire sat idle, and a 7 MB/s download by short-lived
+//! `curl` processes was 92% unattributed in `rchar` sums because dead pids vanish from
+//! `/proc` before the next sample.
+//!
+//! Known limits (by kernel design, documented not hidden): UDP/QUIC traffic has no
+//! per-socket byte counters, so it lands in the `unattributed` remainder; connections
+//! that die mid-window lose their in-window bytes (bounded by the 3 s tick); counters
+//! reset on reconnect, so churned sets clamp at zero instead of going negative
+//! (a naive pid-level delta summed to *negative* rates live).
+//!
+//! All samplers share lightweight timestamped stat caches.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -51,54 +65,24 @@ pub struct InterfaceInfo {
     pub tx_bytes: u64,
 }
 
+/// One baseline sample for a single TCP connection.
+/// Public only so [`attribute_tcp_rates`] can take baselines across crates.
 #[derive(Debug, Clone, Copy)]
-struct ProcIoSample {
-    ts_ms: u128,
-    rchar: u64,
-    wchar: u64,
+pub struct TcpSample {
+    /// Baseline timestamp (millis since epoch).
+    pub ts_ms: u128,
+    /// Baseline cumulative `bytes_sent`.
+    pub sent: u64,
+    /// Baseline cumulative `bytes_received`.
+    pub recv: u64,
 }
 
-const DEFAULT_PROC_STAT_FILE: &str = "flex-net-proc.stat";
+const DEFAULT_TCP_STAT_FILE: &str = "flex-net-tcp.stat";
 
-/// Static process I/O sample cache across ticks.
-fn proc_io_cache() -> &'static Mutex<HashMap<u32, ProcIoSample>> {
-    static CACHE: OnceLock<Mutex<HashMap<u32, ProcIoSample>>> = OnceLock::new();
+/// Static per-connection baseline cache across ticks.
+fn tcp_cache() -> &'static Mutex<HashMap<ConnKey, TcpSample>> {
+    static CACHE: OnceLock<Mutex<HashMap<ConnKey, TcpSample>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// OPT-7 `inet_inode → pid` membership cache: `pid → (has sockets, probed
-/// at)`. `fd` rescans run only for new pids; entries re-probe after a
-/// per-pid staggered TTL so a process that opens its first socket later is
-/// picked up within ~8–15 s instead of being missed until it exits.
-fn pid_net_cache() -> &'static Mutex<HashMap<u32, (bool, std::time::Instant)>> {
-    static CACHE: OnceLock<Mutex<HashMap<u32, (bool, std::time::Instant)>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Staggered re-probe TTL for one pid (8–15 s by pid hash, so expiries do
-/// not stampede on the same tick).
-fn pid_net_ttl(pid: u32) -> std::time::Duration {
-    std::time::Duration::from_secs(8 + u64::from(pid % 8))
-}
-
-/// Cached [`has_network_sockets`]: rescan fds only for new pids (or stale
-/// entries past their TTL).
-fn has_network_sockets_cached(pid: u32, inet_inodes: &HashSet<u64>) -> bool {
-    if let Ok(guard) = pid_net_cache().lock() {
-        if let Some(&(hit, at)) = guard.get(&pid) {
-            if at.elapsed() < pid_net_ttl(pid) {
-                return hit;
-            }
-        }
-    }
-    let hit = has_network_sockets(pid, inet_inodes);
-    if let Ok(mut guard) = pid_net_cache().lock() {
-        if guard.len() > 4096 {
-            guard.clear();
-        }
-        guard.insert(pid, (hit, std::time::Instant::now()));
-    }
-    hit
 }
 
 /// Resolve the stat cache file path.
@@ -117,54 +101,72 @@ fn stat_file_path() -> PathBuf {
     std::env::temp_dir().join(format!("{DEFAULT_STAT_FILE}-{user}"))
 }
 
-/// Resolve the process stat cache file path.
-fn proc_stat_file_path() -> PathBuf {
+/// Resolve the per-connection TCP baseline cache file path.
+fn tcp_stat_file_path() -> PathBuf {
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         if !runtime_dir.is_empty() {
-            return PathBuf::from(runtime_dir).join(DEFAULT_PROC_STAT_FILE);
+            return PathBuf::from(runtime_dir).join(DEFAULT_TCP_STAT_FILE);
         }
     }
     let user = std::env::var("USER").unwrap_or_else(|_| "default".to_string());
-    std::env::temp_dir().join(format!("{DEFAULT_PROC_STAT_FILE}-{user}"))
+    std::env::temp_dir().join(format!("{DEFAULT_TCP_STAT_FILE}-{user}"))
 }
 
-/// Read cached process samples from disk.
-fn read_proc_stat_cache(path: &Path) -> HashMap<u32, ProcIoSample> {
+/// Read cached per-connection baselines from disk.
+///
+/// Line shape: `<pid|-> <ts_ms> <sent> <recv> <local> <peer>` (addresses hold
+/// no spaces, IPv6 colons included). Malformed lines are skipped; a missing
+/// file reads as empty (first run reports zero rates, like every sampler).
+fn read_tcp_stat_cache(path: &Path) -> HashMap<ConnKey, TcpSample> {
     let mut map = HashMap::new();
     let Ok(content) = std::fs::read_to_string(path) else {
         return map;
     };
     for line in content.lines() {
         let mut fields = line.split_whitespace();
-        let Some(pid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
+        let Some(pid_raw) = fields.next() else {
             continue;
         };
-        let Some(ts_ms) = fields.next().and_then(|s| s.parse::<u128>().ok()) else {
+        let pid = if pid_raw == "-" {
+            None
+        } else if let Ok(pid) = pid_raw.parse::<u32>() {
+            Some(pid)
+        } else {
             continue;
         };
-        let Some(rchar) = fields.next().and_then(|s| s.parse::<u64>().ok()) else {
-            continue;
-        };
-        let Some(wchar) = fields.next().and_then(|s| s.parse::<u64>().ok()) else {
+        let (Some(ts_ms), Some(sent), Some(recv), Some(local), Some(peer)) = (
+            fields.next().and_then(|s| s.parse::<u128>().ok()),
+            fields.next().and_then(|s| s.parse::<u64>().ok()),
+            fields.next().and_then(|s| s.parse::<u64>().ok()),
+            fields.next(),
+            fields.next(),
+        ) else {
             continue;
         };
         map.insert(
-            pid,
-            ProcIoSample {
-                ts_ms,
-                rchar,
-                wchar,
+            ConnKey {
+                local: local.to_string(),
+                peer: peer.to_string(),
+                pid,
             },
+            TcpSample { ts_ms, sent, recv },
         );
     }
     map
 }
 
-/// Write process samples to disk.
-fn write_proc_stat_cache(path: &Path, samples: &HashMap<u32, ProcIoSample>) {
-    let mut buf = String::with_capacity(samples.len() * 40);
-    for (pid, s) in samples {
-        let _ = writeln!(buf, "{} {} {} {}", pid, s.ts_ms, s.rchar, s.wchar);
+/// Write per-connection baselines to disk.
+fn write_tcp_stat_cache(path: &Path, samples: &HashMap<ConnKey, TcpSample>) {
+    let mut buf = String::with_capacity(samples.len() * 80);
+    for (key, s) in samples {
+        let pid = key
+            .pid
+            .map_or_else(|| "-".to_string(), |pid| pid.to_string());
+        let _ = writeln!(
+            buf,
+            "{} {} {} {} {} {}",
+            pid, s.ts_ms, s.sent, s.recv, key.local, key.peer
+        );
     }
     let _ = std::fs::write(path, buf);
 }
@@ -323,195 +325,240 @@ pub fn read_proc_comm(stat_file: &Path) -> Option<String> {
     }
 }
 
-/// Read process `(rchar, wchar)` from `/proc/<pid>/io`.
-#[must_use]
-pub fn read_proc_io(io_file: &Path) -> Option<(u64, u64)> {
-    let content = std::fs::read_to_string(io_file).ok()?;
-    let mut rx = None;
-    let mut tx = None;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("rchar:") {
-            rx = rest.trim().parse::<u64>().ok();
-        } else if let Some(rest) = line.strip_prefix("wchar:") {
-            tx = rest.trim().parse::<u64>().ok();
-        }
-    }
-    match (rx, tx) {
-        (Some(r), Some(t)) => Some((r, t)),
-        _ => None,
-    }
+/// One TCP connection's cumulative counters from `ss -tinp`.
+///
+/// `pid` is the first owning process (`None` = kernel-owned or a foreign
+/// user's socket, which unprivileged `ss -p` omits); `sent`/`recv` are
+/// `bytes_sent`/`bytes_received`. Counters reset whenever the connection
+/// dies, so attribution must clamp per-connection deltas at zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SsConn {
+    /// Local `addr:port` token as printed.
+    pub local: String,
+    /// Peer `addr:port` token as printed.
+    pub peer: String,
+    /// Owning pid, if visible.
+    pub pid: Option<u32>,
+    /// Cumulative `bytes_sent`.
+    pub sent: u64,
+    /// Cumulative `bytes_received`.
+    pub recv: u64,
 }
 
-/// Collect all open INET (TCP, UDP, RAW) socket inodes from `/proc/net/`.
-#[must_use]
-pub fn collect_inet_socket_inodes() -> HashSet<u64> {
-    let mut inodes = HashSet::new();
-    let tables = [
-        "/proc/net/tcp",
-        "/proc/net/tcp6",
-        "/proc/net/udp",
-        "/proc/net/udp6",
-        "/proc/net/raw",
-        "/proc/net/raw6",
-    ];
-    for table in tables {
-        let Ok(content) = std::fs::read_to_string(table) else {
-            continue;
-        };
-        for line in content.lines().skip(1) {
-            let mut fields = line.split_whitespace();
-            if let Some(inode_str) = fields.nth(9) {
-                if let Ok(inode) = inode_str.parse::<u64>() {
-                    if inode > 0 {
-                        inodes.insert(inode);
-                    }
-                }
-            }
-        }
-    }
-    inodes
+/// Identity of one tracked connection: endpoints plus owner. A socket that
+/// changes owner (fd passing on fork) tracks as a fresh connection.
+/// Public only so [`attribute_tcp_rates`] can take baselines across crates.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConnKey {
+    /// Local `addr:port` token as printed by `ss`.
+    pub local: String,
+    /// Peer `addr:port` token as printed by `ss`.
+    pub peer: String,
+    /// Owning pid, if visible.
+    pub pid: Option<u32>,
 }
 
-/// Check if a process has at least one open file descriptor matching an INET socket inode.
+/// Parse the decimal after `key:` in an `ss` info fragment (`None` when the
+/// key is absent or non-numeric — ss versions vary, counters degrade to 0,
+/// never to an error).
+fn ss_counter(fragment: &str, key: &str) -> u64 {
+    fragment
+        .find(key)
+        .and_then(|at| {
+            fragment[at + key.len()..]
+                .chars()
+                .take_while(|c| c.is_numeric())
+                .collect::<String>()
+                .parse::<u64>()
+                .ok()
+        })
+        .unwrap_or(0)
+}
+
+/// Parse the first `pid=<n>` in an `ss -p` process fragment.
+fn ss_pid(fragment: &str) -> Option<u32> {
+    fragment.find("pid=").and_then(|at| {
+        fragment[at + 4..]
+            .chars()
+            .take_while(|c| c.is_numeric())
+            .collect::<String>()
+            .parse::<u32>()
+            .ok()
+    })
+}
+
+/// Parse `ss -tinp` output into one [`SsConn`] per connection header.
+///
+/// Header lines start at column 0 (`State … Local Peer [users:(…)]`; the
+/// trailing address pair is taken as local/peer so column-count drift cannot
+/// misalign them); indented continuation lines carry the counters. A header
+/// without counters yields a zero record (e.g. `LISTEN` sockets).
 #[must_use]
-pub fn has_network_sockets<S: std::hash::BuildHasher>(
-    pid: u32,
-    inet_inodes: &HashSet<u64, S>,
-) -> bool {
-    let fd_dir = PathBuf::from(format!("/proc/{pid}/fd"));
-    let Ok(entries) = std::fs::read_dir(fd_dir) else {
-        return false;
+pub fn parse_ss_tcp(text: &str) -> Vec<SsConn> {
+    let mut conns = Vec::new();
+    let mut current: Option<SsConn> = None;
+    let flush = |current: &mut Option<SsConn>, conns: &mut Vec<SsConn>| {
+        if let Some(conn) = current.take() {
+            conns.push(conn);
+        }
     };
-    for entry in entries.flatten() {
-        let Ok(target) = std::fs::read_link(entry.path()) else {
-            continue;
-        };
-        let target_str = target.to_string_lossy();
-        if let Some(rest) = target_str.strip_prefix("socket:[") {
-            if let Some(inode_str) = rest.strip_suffix(']') {
-                if let Ok(inode) = inode_str.parse::<u64>() {
-                    if inet_inodes.contains(&inode) {
-                        return true;
-                    }
-                }
+    for line in text.lines() {
+        if line.starts_with(char::is_whitespace) {
+            if let Some(conn) = current.as_mut() {
+                conn.sent = conn.sent.max(ss_counter(line, "bytes_sent:"));
+                conn.recv = conn.recv.max(ss_counter(line, "bytes_received:"));
             }
+            continue;
         }
+        let mut current_slot = current.take();
+        flush(&mut current_slot, &mut conns);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("Netid") || trimmed.starts_with("State") {
+            continue;
+        }
+        let (addrs, proc) = match line.find("users:(") {
+            Some(at) => (&line[..at], Some(&line[at..])),
+            None => (line, None),
+        };
+        let tokens: Vec<&str> = addrs.split_whitespace().collect();
+        if tokens.len() < 2 {
+            continue;
+        }
+        let peer = tokens[tokens.len() - 1].to_string();
+        let local = tokens[tokens.len() - 2].to_string();
+        current = Some(SsConn {
+            local,
+            peer,
+            pid: proc.and_then(ss_pid),
+            sent: 0,
+            recv: 0,
+        });
     }
-    false
+    let mut tail = current.take();
+    flush(&mut tail, &mut conns);
+    conns
 }
 
-/// Scan `/proc` to collect and calculate per-process network I/O rates.
+/// Run `ss -tinp` once and capture stdout (`None` when `ss` is missing or
+/// fails — the caller degrades to unattributed rows, never to an error).
+fn ss_tcp_output() -> Option<String> {
+    let output = Command::new("ss")
+        .args(["-t", "-i", "-n", "-p"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Attribute current connections against per-connection baselines.
+///
+/// Pure (no I/O): `prev` maps [`ConnKey`] to its last sample; returns
+/// `(per-pid rates, fresh baselines)`. Every owned connection appears in the
+/// rates (new ones at zero, so the list shows what's connected immediately);
+/// surviving connections add `delta / own elapsed`; deltas clamp at zero
+/// (counters reset on reconnect — a naive pid-level sum measured *negative*
+/// live under churn); vanished baselines are dropped (their in-window bytes
+/// are unrecoverable — bounded by the tick interval, surfaced as
+/// unattributed by [`snapshot_bandwidth`]). Baselines older than 60 s or
+/// newer than 100 ms contribute zero, mirroring every other sampler here.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
-pub fn scan_top_talkers() -> Vec<ProcessBandwidth> {
+pub fn attribute_tcp_rates<S: std::hash::BuildHasher>(
+    now_ms: u128,
+    prev: &HashMap<ConnKey, TcpSample, S>,
+    cur: &[SsConn],
+) -> (HashMap<u32, (f64, f64)>, HashMap<ConnKey, TcpSample>) {
+    let mut per_pid: HashMap<u32, (f64, f64)> = HashMap::new();
+    let mut fresh = HashMap::with_capacity(cur.len());
+    for conn in cur {
+        let key = ConnKey {
+            local: conn.local.clone(),
+            peer: conn.peer.clone(),
+            pid: conn.pid,
+        };
+        fresh.insert(
+            key.clone(),
+            TcpSample {
+                ts_ms: now_ms,
+                sent: conn.sent,
+                recv: conn.recv,
+            },
+        );
+        let Some(pid) = conn.pid else {
+            continue;
+        };
+        let entry = per_pid.entry(pid).or_insert((0.0, 0.0));
+        let Some(baseline) = prev.get(&key) else {
+            continue;
+        };
+        let elapsed_ms = now_ms.saturating_sub(baseline.ts_ms);
+        if !(100..=60_000).contains(&elapsed_ms) {
+            continue;
+        }
+        let delta_sec = elapsed_ms as f64 / 1000.0;
+        let rx_rate = conn.recv.saturating_sub(baseline.recv) as f64 / delta_sec;
+        let tx_rate = conn.sent.saturating_sub(baseline.sent) as f64 / delta_sec;
+        entry.0 += rx_rate;
+        entry.1 += tx_rate;
+    }
+    (per_pid, fresh)
+}
+
+/// Scan TCP connections and calculate per-process socket throughput.
+///
+/// One `ss -tinp` spawn per call (callers throttle to the 3 s tick):
+/// surviving connections contribute clamped counter deltas, new ones ride
+/// the baseline for next tick, and a missing `ss` degrades to an empty set.
+/// `share` stays `0.0` here — [`snapshot_bandwidth`] rebases it on the
+/// interface total. Sorted by total rate, ties by pid.
+#[must_use]
+pub fn scan_tcp_talkers() -> Vec<ProcessBandwidth> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
 
-    let mut guard = match proc_io_cache().lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
+    let mut guard = match tcp_cache().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     };
 
-    let proc_stat_path = proc_stat_file_path();
+    let tcp_stat_path = tcp_stat_file_path();
     if guard.is_empty() {
-        *guard = read_proc_stat_cache(&proc_stat_path);
+        *guard = read_tcp_stat_cache(&tcp_stat_path);
     }
 
-    let inet_inodes = collect_inet_socket_inodes();
-    let current_pid = std::process::id();
-
-    let proc_dir = Path::new("/proc");
-    let Ok(entries) = std::fs::read_dir(proc_dir) else {
+    let Some(output) = ss_tcp_output() else {
         return Vec::new();
     };
+    let conns = parse_ss_tcp(&output);
+    let (per_pid, fresh) = attribute_tcp_rates(now_ms, &guard, &conns);
+    // Skip the disk write when the socket set is empty (idle ticks cost no
+    // I/O); the in-memory cache is always updated.
+    if !conns.is_empty() {
+        write_tcp_stat_cache(&tcp_stat_path, &fresh);
+    }
+    *guard = fresh;
 
-    let mut fresh_cache = HashMap::new();
-    let mut results = Vec::new();
-    let mut seen_pids: HashSet<u32> = HashSet::new();
-
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name_str) = file_name.to_str() else {
-            continue;
-        };
-        let Ok(pid) = name_str.parse::<u32>() else {
-            continue;
-        };
-
-        if pid == current_pid {
-            continue;
-        }
-        seen_pids.insert(pid);
-
-        // Only monitor processes with actual network/internet sockets (filters out local IPC/pipes/Wayland).
-        // OPT-7: fd rescan only for new pids via the `pid_net_cache`.
-        if !has_network_sockets_cached(pid, &inet_inodes) {
-            continue;
-        }
-
-        let io_file = entry.path().join("io");
-        let stat_file = entry.path().join("stat");
-
-        let Some((rchar, wchar)) = read_proc_io(&io_file) else {
-            continue;
-        };
-        let comm = read_proc_comm(&stat_file).unwrap_or_else(|| format!("pid-{pid}"));
-
-        if let Some(prev) = guard.get(&pid) {
-            let elapsed_ms = now_ms.saturating_sub(prev.ts_ms);
-            if (100..=60_000).contains(&elapsed_ms) {
-                let delta_sec = elapsed_ms as f64 / 1000.0;
-                let rx_diff = rchar.saturating_sub(prev.rchar);
-                let tx_diff = wchar.saturating_sub(prev.wchar);
-                let rx_rate = rx_diff as f64 / delta_sec;
-                let tx_rate = tx_diff as f64 / delta_sec;
-                let total_rate = rx_rate + tx_rate;
-
-                results.push(ProcessBandwidth {
-                    pid,
-                    comm,
-                    rx_rate,
-                    tx_rate,
-                    total_rate,
-                    share: 0.0,
-                });
+    let mut results: Vec<ProcessBandwidth> = per_pid
+        .into_iter()
+        .map(|(pid, (rx_rate, tx_rate))| {
+            let comm = read_proc_comm(&PathBuf::from(format!("/proc/{pid}/stat")))
+                .unwrap_or_else(|| format!("pid-{pid}"));
+            ProcessBandwidth {
+                total_rate: rx_rate + tx_rate,
+                rx_rate,
+                tx_rate,
+                pid,
+                comm,
+                share: 0.0,
             }
-        }
-
-        fresh_cache.insert(
-            pid,
-            ProcIoSample {
-                ts_ms: now_ms,
-                rchar,
-                wchar,
-            },
-        );
-    }
-
-    // OPT-7: write the proc-stat cache only when rates were requested
-    // (non-empty talker set); idle ticks with no network processes skip the
-    // disk write entirely. The in-memory `proc_io_cache` is always updated.
-    // Prune exited pids from the fd-membership cache.
-    if !results.is_empty() {
-        write_proc_stat_cache(&proc_stat_path, &fresh_cache);
-    }
-    *guard = fresh_cache;
-    if let Ok(mut net_guard) = pid_net_cache().lock() {
-        net_guard.retain(|pid, _| seen_pids.contains(pid));
-    }
-
-    let total_active_bandwidth: f64 = results.iter().map(|p| p.total_rate).sum();
-    for p in &mut results {
-        if total_active_bandwidth > 0.0 {
-            #[allow(clippy::cast_possible_truncation)]
-            let share = (p.total_rate / total_active_bandwidth).clamp(0.0, 1.0) as f32;
-            p.share = share;
-        } else {
-            p.share = 0.0;
-        }
-    }
+        })
+        .collect();
 
     results.sort_by(|a, b| {
         b.total_rate
@@ -521,6 +568,53 @@ pub fn scan_top_talkers() -> Vec<ProcessBandwidth> {
     });
 
     results
+}
+
+/// One consistent bandwidth sample: interface totals plus TCP attribution.
+///
+/// Built from a single [`sample_interface_rates`] call, so header, rows and
+/// remainder describe the same window.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BandwidthSnapshot {
+    /// `(iface, rx_rate, tx_rate)` wire throughput; `None` when offline.
+    pub iface: Option<(String, f64, f64)>,
+    /// TCP-attributed processes, `share` rebased on the interface total.
+    pub talkers: Vec<ProcessBandwidth>,
+    /// `(rx, tx)` wire bytes no pid claims: UDP/QUIC, churned or
+    /// short-lived connections, kernel traffic. Clamped at zero.
+    pub unattributed: (f64, f64),
+}
+
+/// Sample interface throughput plus per-process TCP attribution.
+///
+/// `share` is each talker's fraction of the *interface* total (so the bars
+/// read as wire share); anything the sockets don't explain lands in
+/// [`BandwidthSnapshot::unattributed`] instead of inflating a row.
+#[must_use]
+pub fn snapshot_bandwidth() -> BandwidthSnapshot {
+    let iface = sample_interface_rates();
+    let mut talkers = scan_tcp_talkers();
+    let unattributed = match &iface {
+        Some((_, rx_rate, tx_rate)) => {
+            let total = rx_rate + tx_rate;
+            if total > 0.0 {
+                for process in &mut talkers {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let share = (process.total_rate / total).clamp(0.0, 1.0) as f32;
+                    process.share = share;
+                }
+            }
+            let sum_rx: f64 = talkers.iter().map(|process| process.rx_rate).sum();
+            let sum_tx: f64 = talkers.iter().map(|process| process.tx_rate).sum();
+            ((rx_rate - sum_rx).max(0.0), (tx_rate - sum_tx).max(0.0))
+        }
+        None => (0.0, 0.0),
+    };
+    BandwidthSnapshot {
+        iface,
+        talkers,
+        unattributed,
+    }
 }
 
 /// Parse local IP address from `/proc/net/fib_trie`.
@@ -622,16 +716,19 @@ fn write_stat(path: &Path, ts: u128, rx: u64, tx: u64) {
     let _ = std::fs::write(path, content);
 }
 
-/// Sample throughput and format Waybar JSON with multiline Top Bandwidth Consumers tooltip.
+/// Sample default-interface throughput from kernel counters.
+///
+/// Returns `(iface, rx_rate, tx_rate)` in bytes/sec, sharing the same
+/// on-disk baseline as [`sample_json`] so every consumer (waybar text,
+/// TUI header, `--top`) reports identical rates for the same window.
+/// `None` when there is no default interface or its counters are unreadable.
+/// First call after boot (no baseline yet) records the baseline and reports
+/// `Some` with zero rates.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
-pub fn sample_json() -> String {
-    let Some(iface) = default_interface() else {
-        return r#"{"text":"⬇ ?  ⬆ ?","class":"idle"}"#.to_string();
-    };
-    let Some((rx, tx)) = interface_bytes(&iface) else {
-        return r#"{"text":"⬇ ?  ⬆ ?","class":"idle"}"#.to_string();
-    };
+pub fn sample_interface_rates() -> Option<(String, f64, f64)> {
+    let iface = default_interface()?;
+    let (rx, tx) = interface_bytes(&iface)?;
 
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -639,29 +736,36 @@ pub fn sample_json() -> String {
         .as_millis();
 
     let stat_path = stat_file_path();
-    let (down_str, up_str, rx_rate, tx_rate) =
-        if let Some((prev_ms, prev_rx, prev_tx)) = read_stat(&stat_path) {
-            let elapsed_ms = now_ms.saturating_sub(prev_ms);
-            if (50..=60_000).contains(&elapsed_ms) {
-                let delta_sec = elapsed_ms as f64 / 1000.0;
-                let rx_diff = rx.saturating_sub(prev_rx);
-                let tx_diff = tx.saturating_sub(prev_tx);
-                let rx_rate = rx_diff as f64 / delta_sec;
-                let tx_rate = tx_diff as f64 / delta_sec;
-                (
-                    format_speed(rx_rate),
-                    format_speed(tx_rate),
-                    rx_rate,
-                    tx_rate,
-                )
-            } else {
-                (format_speed(0.0), format_speed(0.0), 0.0, 0.0)
-            }
+    let (rx_rate, tx_rate) = if let Some((prev_ms, prev_rx, prev_tx)) = read_stat(&stat_path) {
+        let elapsed_ms = now_ms.saturating_sub(prev_ms);
+        if (50..=60_000).contains(&elapsed_ms) {
+            let delta_sec = elapsed_ms as f64 / 1000.0;
+            let rx_diff = rx.saturating_sub(prev_rx);
+            let tx_diff = tx.saturating_sub(prev_tx);
+            (rx_diff as f64 / delta_sec, tx_diff as f64 / delta_sec)
         } else {
-            (format_speed(0.0), format_speed(0.0), 0.0, 0.0)
-        };
+            (0.0, 0.0)
+        }
+    } else {
+        (0.0, 0.0)
+    };
 
     write_stat(&stat_path, now_ms, rx, tx);
+    Some((iface, rx_rate, tx_rate))
+}
+
+/// Sample throughput and format Waybar JSON with multiline Top Bandwidth Consumers tooltip.
+///
+/// Talkers come from the same [`snapshot_bandwidth`] the TUI rows use, so
+/// the tooltip agrees with the monitor by construction.
+#[must_use]
+pub fn sample_json() -> String {
+    let snapshot = snapshot_bandwidth();
+    let Some((iface, rx_rate, tx_rate)) = snapshot.iface else {
+        return r#"{"text":"⬇ ?  ⬆ ?","class":"idle"}"#.to_string();
+    };
+    let (down_str, up_str) = (format_speed(rx_rate), format_speed(tx_rate));
+    let (rx, tx) = interface_bytes(&iface).unwrap_or((0, 0));
 
     let total_rate = rx_rate + tx_rate;
     let class = if total_rate >= MB {
@@ -672,7 +776,7 @@ pub fn sample_json() -> String {
         "idle"
     };
 
-    let top_talkers = scan_top_talkers();
+    let top_talkers = snapshot.talkers;
     let local_ip = local_ip_from_fib_trie(Path::new("/proc/net/fib_trie"))
         .unwrap_or_else(|| "127.0.0.1/8".to_string());
     let routes = route_info(Path::new("/proc/net/route"));
@@ -712,10 +816,17 @@ pub fn sample_json() -> String {
         }
     }
 
-    let escaped_tooltip = tooltip
-        .replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace('"', "\\\"");
+    // Single-pass JSON escape: the old `.replace().replace().replace()`
+    // walked the tooltip three times; this reserves once and escapes inline.
+    let mut escaped_tooltip = String::with_capacity(tooltip.len() + 16);
+    for c in tooltip.chars() {
+        match c {
+            '\\' => escaped_tooltip.push_str("\\\\"),
+            '\n' => escaped_tooltip.push_str("\\n"),
+            '"' => escaped_tooltip.push_str("\\\""),
+            _ => escaped_tooltip.push(c),
+        }
+    }
 
     format!(
         r#"{{"text":" {down_str}   {up_str}","tooltip":"{escaped_tooltip}","class":"{class}"}}"#

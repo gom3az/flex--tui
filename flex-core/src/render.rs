@@ -328,6 +328,9 @@ thread_local! {
     /// live only for the `render` call that draws them.
     static SCRATCH_A: RefCell<String> = const { RefCell::new(String::new()) };
     static SCRATCH_B: RefCell<String> = const { RefCell::new(String::new()) };
+    /// Reused tab-width buffer: avoids `Vec<u16>` alloc per frame in the
+    /// tab bar (tabs are few, but the bar draws every frame).
+    static TAB_WIDTHS: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Cached display width of [`HELP_LINES`]' longest line (OPT-3): measured
@@ -552,26 +555,51 @@ fn draw_tab_bar(buf: &mut Buffer, ox: u16, y: u16, width: usize, menu: &Menu) {
     let theme = &menu.theme;
     let total_tabs = menu.app.tabs.len();
 
-    // Tab titles come from the per-tab memo (OPT-3): sanitized once per
-    // content change, borrowed here with no per-frame measure or alloc.
-    let names: Vec<std::cell::Ref<'_, crate::CachedText>> =
-        menu.app.tabs.iter().map(|tab| tab.name_texts()).collect();
-    let tab_widths: Vec<u16> = names
-        .iter()
-        .map(|name| {
-            u16::try_from(name.measured.width)
+    // Tab widths from the per-tab memo (OPT-3): measure once per frame into
+    // a reused thread-local buffer — no `Vec<Ref>` holding every tab and no
+    // `Vec<u16>` alloc. Titles are re-borrowed per rendered index below, so
+    // each `Ref` lives only for its own row.
+    let total_needed: usize = TAB_WIDTHS.with(|slot| {
+        let mut widths = slot.borrow_mut();
+        widths.clear();
+        widths.reserve(total_tabs);
+        let mut total = 0_usize;
+        for tab in &menu.app.tabs {
+            let w = u16::try_from(tab.name_texts().measured.width)
                 .unwrap_or(u16::MAX)
-                .saturating_add(2)
-        })
-        .collect();
+                .saturating_add(2);
+            widths.push(w);
+            total = total.saturating_add(usize::from(w));
+        }
+        total
+    });
 
-    let total_needed: usize = tab_widths.iter().map(|&w| usize::from(w)).sum();
+    // Local copy of widths for the layout below (tabs are few; this small
+    // stack copy avoids holding the thread-local borrow across renders).
+    // Fast path for the common case (<=16 tabs): stack array, no heap.
+    let mut stack_widths = [0_u16; 16];
+    let heap_widths: Option<Vec<u16>> = TAB_WIDTHS.with(|slot| {
+        let widths = slot.borrow();
+        if widths.len() <= stack_widths.len() {
+            stack_widths[..widths.len()].copy_from_slice(&widths);
+            None
+        } else {
+            Some(widths.clone())
+        }
+    });
+    let tab_width = |index: usize| -> u16 {
+        heap_widths
+            .as_ref()
+            .map_or(stack_widths[index], |heap| heap[index])
+    };
 
     if total_needed <= width {
         let mut cur_x = ox;
-        for (index, name) in names.iter().enumerate() {
-            let tab_w = tab_widths[index];
+        for index in 0..total_tabs {
+            let tab_w = tab_width(index);
             let tab_area = Rect::new(cur_x, y, tab_w, 1);
+            // Re-borrow per tab: Ref drops at end of iteration.
+            let name = menu.app.tabs[index].name_texts();
             let line = if index == menu.app.active {
                 Line::from(vec![
                     Span::styled(char_set.tab_marker_left, theme.tab_marker),
@@ -603,21 +631,19 @@ fn draw_tab_bar(buf: &mut Buffer, ox: u16, y: u16, width: usize, menu: &Menu) {
     loop {
         let left_ind = usize::from(start > 0);
         let right_ind = usize::from(end < total_tabs - 1);
-        let current_w: usize = tab_widths[start..=end]
-            .iter()
-            .map(|&w| usize::from(w))
-            .sum::<usize>()
-            + left_ind
-            + right_ind;
+        let mut current_w: usize = left_ind + right_ind;
+        for index in start..=end {
+            current_w = current_w.saturating_add(usize::from(tab_width(index)));
+        }
 
         let can_expand_left = start > 0
             && current_w
-                + usize::from(tab_widths[start - 1])
+                + usize::from(tab_width(start - 1))
                 + usize::from(start - 1 > 0 && left_ind == 0)
                 <= width;
         let can_expand_right = end < total_tabs - 1
             && current_w
-                + usize::from(tab_widths[end + 1])
+                + usize::from(tab_width(end + 1))
                 + usize::from(end + 1 < total_tabs - 1 && right_ind == 0)
                 <= width;
 
@@ -648,13 +674,13 @@ fn draw_tab_bar(buf: &mut Buffer, ox: u16, y: u16, width: usize, menu: &Menu) {
             break;
         }
         let right_ind_reserved = usize::from(end < total_tabs - 1 && index == end);
-        let render_w = tab_widths[index]
+        let render_w = tab_width(index)
             .min(u16::try_from(available.saturating_sub(right_ind_reserved)).unwrap_or(u16::MAX));
         if render_w == 0 {
             break;
         }
         let tab_area = Rect::new(cur_x, y, render_w, 1);
-        let name = &names[index];
+        let name = menu.app.tabs[index].name_texts();
         if index == menu.app.active {
             Line::from(vec![
                 Span::styled(char_set.tab_marker_left, theme.tab_marker),
@@ -1144,6 +1170,13 @@ fn draw_volume(buf: &mut Buffer, area: Rect, menu: &Menu, row: &Row) {
                 let mut blank = blank_slot.borrow_mut();
                 filled.clear();
                 blank.clear();
+                // Reserve once: the old loop regrew the buffers cell by cell.
+                filled.reserve(count.saturating_mul(char_set.volume_filled.len().max(1)));
+                blank.reserve(
+                    bar_w
+                        .saturating_sub(count)
+                        .saturating_mul(char_set.volume_empty.len().max(1)),
+                );
                 for _ in 0..count {
                     filled.push_str(char_set.volume_filled);
                 }
@@ -1209,16 +1242,18 @@ fn draw_dropdown(buf: &mut Buffer, list_area: Rect, menu: &mut Menu, ctx: &Frame
     // above the selected object (`node_widget.rs:63-89`). Flex measures the
     // display width (upstream uses the byte length); the widths come from
     // the target memos, so this is arithmetic, not a re-measure (OPT-3).
+    // Single pass: collect memos while tracking the max width (was two
+    // passes: collect + max).
+    let mut max_target_width = 0_usize;
     let titles: Vec<std::cell::Ref<'_, crate::CachedText>> = row
         .targets
         .iter()
-        .map(|target| target.title_texts())
+        .map(|target| {
+            let memo = target.title_texts();
+            max_target_width = max_target_width.max(memo.measured.width);
+            memo
+        })
         .collect();
-    let max_target_width = titles
-        .iter()
-        .map(|title| title.measured.width)
-        .max()
-        .unwrap_or(0);
     #[allow(clippy::cast_possible_truncation)]
     let dropdown_width = (max_target_width.saturating_add(4)) as u16;
     #[allow(clippy::cast_possible_truncation)]
@@ -1239,10 +1274,15 @@ fn draw_dropdown(buf: &mut Buffer, list_area: Rect, menu: &mut Menu, ctx: &Frame
         .borders(Borders::ALL)
         .border_style(menu.theme.dropdown_border)
         .border_type(menu.char_set.dropdown_border);
-    let items: Vec<ListItem> = titles
-        .iter()
-        .map(|title| ListItem::new(Line::from(title.sanitized.as_str())))
-        .collect();
+    let items: Vec<ListItem> = {
+        let mut vec = Vec::with_capacity(titles.len());
+        vec.extend(
+            titles
+                .iter()
+                .map(|title| ListItem::new(Line::from(title.sanitized.as_str()))),
+        );
+        vec
+    };
     let list = List::new(items)
         .block(block)
         .style(menu.theme.dropdown_item)
@@ -1321,7 +1361,13 @@ fn put_str(
             cell.set_style(style);
             cell.set_skip(false);
         }
-        *x += width::char_width(c).max(1);
+        // ASCII fast path: skip the `unicode-width` lookup for the common
+        // case (every ASCII char is 1 cell wide here; widths are CJK-narrow).
+        *x += if c.is_ascii() {
+            1
+        } else {
+            width::char_width(c).max(1)
+        };
     }
 }
 

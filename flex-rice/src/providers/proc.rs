@@ -6,11 +6,17 @@
 //!
 //! - Row `label` is `"<comm> <pid>"`, so the engine's label fuzzy-filter
 //!   matches either the process name or the pid out of the box.
-//! - Row `meta` is `"<cpu%> <mem%> <user>"`; `confirmable` arms the danger
-//!   flow (Enter → SIGTERM, Delete → SIGKILL).
+//! - Row `meta` is `"<cpu%> [bar] <mem> <user>"` with a wifi-style CPU text
+//!   gauge (`12.3% [█░░░░░░░]`); `confirmable` arms the danger flow
+//!   (Enter → SIGTERM, Delete → SIGKILL).
 //! - CPU% is the delta of `utime+stime` over the delta of total system
 //!   jiffies since the previous scan (per-core, so a busy multi-threaded
 //!   process can read >100% like `top`); the first scan reports `0.0`.
+//!   The printed value is always exact; only the bar input clamps to
+//!   0–100 (a 312% reader saturates its gauge, never its number).
+//! - Service-group rows set `hide_target_in_header` so the aggregate
+//!   totals + gauge own the header (member targets stay in the dropdown),
+//!   like the `bt` device rows.
 //! - Kernel threads (empty `/proc/<pid>/cmdline`) are hidden unless
 //!   `FLEX_PROC_KTHREADS` is set non-empty/non-`0`.
 //!
@@ -280,9 +286,9 @@ fn group_processes(collected: Vec<RawProc>) -> Vec<ItemGroup> {
     let mut by_service: HashMap<String, Vec<RawProc>> = HashMap::new();
     let mut singles: Vec<RawProc> = Vec::new();
 
-    for proc_item in collected {
-        if let Some(ref svc) = proc_item.service {
-            by_service.entry(svc.clone()).or_default().push(proc_item);
+    for mut proc_item in collected {
+        if let Some(svc) = proc_item.service.take() {
+            by_service.entry(svc).or_default().push(proc_item);
         } else {
             singles.push(proc_item);
         }
@@ -342,13 +348,23 @@ fn format_child_label(prefix: &str, comm: &str, pid: u32) -> String {
     s
 }
 
+/// CPU text gauge for a compact row meta (`12.3% [█░░░░░░░]`), wifi-style.
+///
+/// The printed percentage is always the exact `cpu` value; only the bar
+/// input clamps to 0–100, since per-core CPU can read >100% like `top`.
+fn cpu_gauge(cpu: f32) -> String {
+    #[allow(clippy::cast_possible_truncation)]
+    let pct = cpu.round().clamp(0.0, 100.0) as i64;
+    format!("{cpu:>5.1}% {}", super::wifi::bar(pct, 100, 8))
+}
+
 /// Build rows for a single item group.
 fn push_group_rows(group: ItemGroup, sort: SortBy, rows: &mut Vec<Row>) {
     match group {
         ItemGroup::Single(p) => {
             let mem_str = format_memory_kb(p.rss_kb);
             let label = format_comm_pid(&p.comm, p.pid);
-            let meta = format!("{mem_str:>7} {:5.1}% {}", p.cpu, p.user);
+            let meta = format!("{} {mem_str:>7} {}", cpu_gauge(p.cpu), p.user);
             let mut row = Row::with_meta(RowId::new(p.pid.to_string()), label, meta);
             row.confirmable = true;
             rows.push(row);
@@ -362,7 +378,7 @@ fn push_group_rows(group: ItemGroup, sort: SortBy, rows: &mut Vec<Row>) {
         } => {
             let count = procs.len();
             let mem_str = format_memory_kb(total_rss_kb);
-            let meta = format!("{mem_str:>7} {total_cpu:5.1}% {user}");
+            let meta = format!("{} {mem_str:>7} {user}", cpu_gauge(total_cpu));
             let targets: Vec<Target> = procs
                 .iter()
                 .map(|p| {
@@ -383,6 +399,9 @@ fn push_group_rows(group: ItemGroup, sort: SortBy, rows: &mut Vec<Row>) {
             let mut row =
                 Row::with_targets(RowId::new(format!("service:{name}")), label, targets, 0);
             row.meta = Some(meta);
+            // Aggregate totals + gauge own the header (member targets stay
+            // in the dropdown), like the `bt` device rows.
+            row.hide_target_in_header = true;
             row.confirmable = true;
             rows.push(row);
 
@@ -390,7 +409,7 @@ fn push_group_rows(group: ItemGroup, sort: SortBy, rows: &mut Vec<Row>) {
                 sort_procs(&mut procs, sort);
                 for (i, p) in procs.iter().enumerate() {
                     let p_mem = format_memory_kb(p.rss_kb);
-                    let p_meta = format!("{p_mem:>7} {:5.1}% {}", p.cpu, p.user);
+                    let p_meta = format!("{} {p_mem:>7} {}", cpu_gauge(p.cpu), p.user);
                     let prefix = if i + 1 == count {
                         "  └─ "
                     } else {
@@ -510,10 +529,18 @@ fn pids() -> Vec<u32> {
     };
     let mut out = Vec::new();
     for entry in entries.flatten() {
-        if let Ok(name) = entry.file_name().into_string() {
-            if let Ok(pid) = name.parse::<u32>() {
-                out.push(pid);
-            }
+        // Borrow the file name: the old `into_string()` allocated an owned
+        // `String` per entry. Numeric names are short ASCII, so `to_str` +
+        // a first-byte digit guard skips `dot`/`sys`/`self` without parsing.
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+            continue;
+        }
+        if let Ok(pid) = name.parse::<u32>() {
+            out.push(pid);
         }
     }
     out
@@ -539,7 +566,9 @@ fn parse_stat(data: &str) -> Option<(String, u64, u64)> {
         return None;
     }
     let comm = data.get(open + 1..close)?.to_string();
-    let rest = stat_after_comm(data)?;
+    // Reuse `close`: the old path re-ran `rfind(')')` inside
+    // `stat_after_comm`. The numeric tail starts after `") "`.
+    let rest = data.get(close + 2..).or_else(|| data.get(close + 1..))?;
     let mut fields = rest.split_whitespace();
     // state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt
     for _ in 0..11 {
@@ -566,15 +595,24 @@ fn read_status(pid: u32) -> Option<(u32, u64)> {
 fn parse_status(data: &str) -> (u32, u64) {
     let mut uid = 0_u32;
     let mut rss_kb = 0_u64;
+    let mut have_uid = false;
+    let mut have_rss = false;
     for line in data.lines() {
         if let Some(value) = line.strip_prefix("Uid:") {
             if let Some(first) = value.split_whitespace().next() {
                 uid = first.parse().unwrap_or(0);
+                have_uid = true;
             }
         } else if let Some(value) = line.strip_prefix("VmRSS:") {
             if let Some(first) = value.split_whitespace().next() {
                 rss_kb = first.parse().unwrap_or(0);
+                have_rss = true;
             }
+        }
+        // `status` files are ~50 lines; both fields sit near the top, so
+        // stop scanning once both are found instead of walking the tail.
+        if have_uid && have_rss {
+            break;
         }
     }
     (uid, rss_kb)
@@ -697,6 +735,18 @@ mod tests {
         assert_eq!(format_memory_kb(2048), "2.0M");
         assert_eq!(format_memory_kb(150 * 1024), "150.0M");
         assert_eq!(format_memory_kb(2 * 1024 * 1024), "2.0G");
+    }
+
+    #[test]
+    fn cpu_gauge_prints_exact_value_with_clamped_bar() {
+        assert_eq!(cpu_gauge(0.0), "  0.0% [░░░░░░░░]");
+        assert_eq!(cpu_gauge(12.3), " 12.3% [█░░░░░░░]");
+        let hot = cpu_gauge(312.4);
+        assert!(
+            hot.starts_with("312.4%"),
+            "per-core overflow prints exact: {hot}"
+        );
+        assert!(hot.contains("[████████]"), "only the bar saturates: {hot}");
     }
 
     #[test]

@@ -97,6 +97,12 @@ pub async fn run_capture(mut menu: Menu) -> Result<Outcome> {
 
     let notify = menu.notifier();
     let mut reader = crossterm::event::EventStream::new();
+    // Reused tick timer: the old `sleep(poll_timeout())` built a fresh
+    // future every frame; an `Interval` reuses the timer registration.
+    let mut ticker = tokio::time::interval(backend::poll_timeout());
+    // The first tick fires immediately on `interval`; skip it so cadence
+    // matches the old sleep-per-loop behavior (tick after 1s, not at open).
+    ticker.tick().await;
     loop {
         let mut area = ratatui::layout::Rect::default();
         terminal
@@ -107,12 +113,14 @@ pub async fn run_capture(mut menu: Menu) -> Result<Outcome> {
             .context("failed to draw frame")?;
         if let (Some(images), Some(tty)) = (images.as_mut(), preview_tty.as_mut()) {
             let pane = render::preview_area(area, &menu);
+            // Borrow the preview path: the old `.clone()` allocated a
+            // `String` every frame even when focus never moved.
             let source = menu
                 .app
                 .focused_row()
-                .and_then(|row| row.preview_image.clone());
+                .and_then(|row| row.preview_image.as_deref());
             let park = render::cursor_position(area, &menu);
-            let _ = images.sync(tty, pane, source.as_deref().map(std::path::Path::new), park);
+            let _ = images.sync(tty, pane, source.map(std::path::Path::new), park);
         }
 
         tokio::select! {
@@ -185,7 +193,7 @@ pub async fn run_capture(mut menu: Menu) -> Result<Outcome> {
             () = notify.notified() => {
                 menu.tick(loop_now(base, &mut step, seeded));
             }
-            () = tokio::time::sleep(backend::poll_timeout()) => {
+            _ = ticker.tick() => {
                 menu.tick(loop_now(base, &mut step, seeded));
             }
         }

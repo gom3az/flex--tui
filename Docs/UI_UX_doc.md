@@ -54,6 +54,12 @@ down the list — `wifi::net_meta` does this (signal `NNN%`, fixed-width bar,
 security padded to the widest class in the list, reserved state column whose
 values are `Connected` / `Saved` / blank, so a saved network visibly will not
 ask for a password).
+This wifi pattern is the default for every provider: quantitative state renders
+as a `NN% [████░░░░]` text gauge in `meta` (via `wifi::bar`), never as
+`Row::volume` (which forces 3-line nodes); rows with dropdown targets set
+`hide_target_in_header` so the gauge stays visible in the header right column.
+`net` (wire-share) and `bt` (battery) follow it; tall detail rows are reserved
+for multi-line content such as `notify` message bodies.
 Glyphs in a mono row must be single-cell: the UI font is a Nerd Font, so
 private-use icons are safe, while colour emoji resolve to a fallback font at
 emoji metrics and shift the row (`wifi::security_text`).

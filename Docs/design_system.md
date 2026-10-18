@@ -62,6 +62,17 @@ one row tall. The moment any row in the tab has detail data, the tab renders
 upstream's full 3-line node. Both modes run the same widget code; only the node
 area height differs (`render::NodeMetrics`, §10).
 
+**Provider default — compact wifi-style rows.** New and updated providers
+render 1-line compact rows: quantitative info (signal, wire share, battery)
+goes in the header `meta` as a text gauge (`NN% [████░░░░]`, via
+`wifi::bar(val, max, 8)`), never in `Row::volume`/`config`/`detail`/`sublabel`.
+Multi-field metas are padded to one column geometry so fields line up down the
+list (`wifi::net_meta`). Rows that carry dropdown targets set
+`hide_target_in_header`, so the gauge-bearing `meta` — not the current target
+title — owns the header right column (the dropdown still lists every target).
+Tall 3-line detail rows are opt-in only, for rows whose content genuinely needs
+more than one line (e.g. the `notify` feed's message body).
+
 ```
 col:   0    1    2     3    4 ...                         W-2  W-1
 line 1  ░    ·    ◇     ·    Node title ................  target/meta
@@ -305,7 +316,7 @@ only elements without an upstream citation:
 |---|---|---|
 | Filter line `› filter…   3/87` | `render.rs:draw_filter` | Type-to-filter; upstream has no filter (its keybinding help replaces it). Uses `filter_prompt`/`hint` tokens. |
 | Hint line under the list | `render.rs:draw_hints` | Confirms danger flows and dropdown state. |
-| Compact nodes | `render::NodeMetrics` | Tabs whose rows carry no volume/peaks/config shrink to 1 line + 1 blank row (pitch 2) instead of upstream's 3 + 2, so data-less lists stay dense: 9 entries at 80x24 instead of 3. Any detail-bearing row restores the full upstream node. |
+| Compact nodes | `render::NodeMetrics` | The default for every provider: rows carry no volume/peaks/config/detail/sublabel, so tabs render 1 line + 1 blank row (pitch 2) — dense wifi-style lists (9 entries at 80x24 instead of 3) with `NN% [████░░░░]` text gauges in `meta`. Tall detail rows are opt-in only (`notify` message bodies); any detail-bearing row restores the full upstream node. |
 | Bare tabs | `Tab::bare_rows` | Provider opt-out of all chrome (tab bar, filter, hints, gauge, right column). A bare tab owns the whole frame, so the list height is the full terminal height; scoped to flex's non-mixer providers (`launch`, `theme`, `clip`, `power`, `shot`). |
 | Gauge row (single volume/brightness widget) | `render.rs:draw_gauge` | Upstream renders per-node volumes instead; flex's `center` provider needs a single-line control. Muted shows the word `muted` (upstream's wording). |
 | `— no matches —` / `— offline` empty states | `render.rs:draw_empty`, `OFFLINE_STATE` | Offline dimming uses the `offline` token (a flex token). |
@@ -325,7 +336,7 @@ only elements without an upstream citation:
 | Device/configuration tabs (profiles, ports, per-device settings) | `device_widget.rs`, `view.rs` | Only the device *row layout* is ported (§3); flex providers have no profile/port data. |
 | Help column widths from config | `help.rs:27-33`, `config/help.rs` | Flex's help is a single fixed table of lines. |
 | PipeWire-specific semantics (default sink/source, routing resolution) | `view.rs` | Providers supply rows; flex renders them. |
-| **Provider-supplied volume/meter/target data** | — | The widgets are implemented and contract-tested, but none of the six shipped providers sets `Row::volume`, `Row::peaks`, `Row::config` or `Row::targets` yet, so those lines render empty in practice. Wiring them is a provider decision (e.g. `center`'s volume row keeps its bash-parity label, which already spells out the percentage). |
+| **Provider-supplied volume/meter/detail data** | — | Opt-in only: list providers (`wifi`, `net`, `bt`) render gauges as text in `meta` and set no `Row::volume`, `Row::peaks`, `Row::config` or `Row::detail`, so every tab stays compact. `Row::volume`/`detail`/`sublabel` are reserved for rows whose content genuinely needs several lines (the `notify` feed). |
 
 ---
 

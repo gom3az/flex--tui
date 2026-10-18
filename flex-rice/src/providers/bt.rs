@@ -4,8 +4,10 @@
 //! - Tab 1: `[Devices]`
 //!   - Top row: Bluetooth power toggle (`Turn Bluetooth Off / On`).
 //!   - Device rows: `<name> <mac>`, marker `◇` on connected audio sink, meta
-//!     `Connected (85%) · Audio` or `Available (-64 dBm)`, `Row::volume`
-//!     battery percentage bar (e.g. 0.85 -> 85% ━━━━━━╌╌).
+//!     `85% [███████░] Connected · Audio` or `Available (-64 dBm)` —
+//!     battery renders as a wifi-style text gauge in `meta`, never as
+//!     `Row::volume`, so every row stays 1-line compact like the wifi
+//!     picker.
 //!   - Dropdown targets: Connect, Disconnect, Set as Default Audio Sink,
 //!     Switch to High Quality (A2DP), Switch to Headset Mode (HFP), Unpair (Forget Device).
 //! - Tab 2: `[Adapters]`
@@ -238,23 +240,26 @@ pub fn is_default_audio_sink(mac: &str, name: &str, default_sink_status: Option<
     let Some(status) = default_sink_status else {
         return false;
     };
-    let mac_underscore = mac.replace(':', "_");
+    // One fold per device (was: `replace` + two `to_lowercase` + one more
+    // for the name). `replace` after folding is equivalent for ASCII MACs.
     let mac_colon = mac.to_lowercase();
-    let mac_underscore_lower = mac_underscore.to_lowercase();
+    let mac_underscore_lower = mac_colon.replace(':', "_");
     let name_lower = name.to_lowercase();
 
     for line in status.lines() {
-        let line_lower = line.to_lowercase();
-        // In wpctl status, active default sink starts with `*` or contains `*`
-        // In pactl info, `Default Sink: bluez_output.F4_4E_FC_21_40_48.1`
+        // Byte-level default-line pre-check before any allocation: most
+        // status lines are not default lines, so they skip the fold.
         let is_default_line = line.contains('*')
-            || line_lower.contains("default sink:")
-            || line_lower.contains("default audio sink");
-
-        if is_default_line
-            && (line_lower.contains(&mac_colon)
-                || line_lower.contains(&mac_underscore_lower)
-                || (!name_lower.is_empty() && line_lower.contains(&name_lower)))
+            || contains_ascii_insensitive(line, "default sink:")
+            || contains_ascii_insensitive(line, "default audio sink");
+        if !is_default_line {
+            continue;
+        }
+        // Case-insensitive substring search without folding the whole line
+        // (was: `line.to_lowercase()` per status line per device).
+        if contains_ascii_insensitive(line, &mac_colon)
+            || contains_ascii_insensitive(line, &mac_underscore_lower)
+            || (!name_lower.is_empty() && contains_ascii_insensitive(line, &name_lower))
         {
             return true;
         }
@@ -262,7 +267,42 @@ pub fn is_default_audio_sink(mac: &str, name: &str, default_sink_status: Option<
     false
 }
 
-/// Construct the meta string for a device row matching Wiremix conventions.
+/// ASCII case-insensitive substring search with no allocation.
+fn contains_ascii_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let hay = haystack.as_bytes();
+    let ndl = needle.as_bytes();
+    if ndl.len() > hay.len() {
+        return false;
+    }
+    // Fast path: first-byte filter before the full window compare.
+    let first = ndl[0].to_ascii_lowercase();
+    for window in hay.windows(ndl.len()) {
+        if window[0].to_ascii_lowercase() != first {
+            continue;
+        }
+        let mut hit = true;
+        for (a, b) in window.iter().zip(ndl.iter()) {
+            if !a.eq_ignore_ascii_case(b) {
+                hit = false;
+                break;
+            }
+        }
+        if hit {
+            return true;
+        }
+    }
+    false
+}
+
+/// Construct the meta string for a device row, wifi-compact style.
+///
+/// Connected rows with a known battery lead with a text gauge
+/// (`85% [███████░]`); rows without a battery keep the plain status text.
+/// Compact by construction: the gauge lives in `meta`, never in
+/// `Row::volume`, so the row renders 1-line.
 #[must_use]
 pub fn build_device_meta(
     connected: bool,
@@ -273,8 +313,16 @@ pub fn build_device_meta(
 ) -> String {
     if connected {
         match (battery, is_audio) {
-            (Some(b), true) => format!("Connected ({b}%) · Audio"),
-            (Some(b), false) => format!("Connected ({b}%)"),
+            (Some(b), true) => format!(
+                "{b:>3}% {} Connected · Audio",
+                super::wifi::bar(i64::from(b), 100, 8)
+            ),
+            (Some(b), false) => {
+                format!(
+                    "{b:>3}% {} Connected",
+                    super::wifi::bar(i64::from(b), 100, 8)
+                )
+            }
             (None, true) => String::from("Connected · Audio"),
             (None, false) => String::from("Connected"),
         }
@@ -313,10 +361,11 @@ pub fn build_device_row(
     let id = RowId::new(format!("device:{mac}"));
     let mut row = Row::with_meta(id, label, meta);
     row.is_default = is_default;
-
-    if let Some(pct) = battery {
-        row.volume = Some(f32::from(pct) / 100.0);
-    }
+    // Rows with targets render the current target (Connect/Disconnect) in
+    // the header right column instead of `meta`; hide it so the battery
+    // gauge + status in `meta` stays visible on the 1-line compact row
+    // (the dropdown still lists every target).
+    row.hide_target_in_header = true;
 
     let mut sink_target = Target::new(
         RowId::new(format!("sink:{mac}")),
@@ -383,7 +432,7 @@ pub fn devices_tab_from(
             )],
         );
         tab.bare_rows = false;
-        tab.filterable = true;
+        tab.filterable = false;
         tab.deletable = false;
         return tab;
     }
@@ -412,7 +461,7 @@ pub fn devices_tab_from(
 
     let mut tab = Tab::with_rows(TAB_DEVICES, rows);
     tab.bare_rows = false;
-    tab.filterable = true;
+    tab.filterable = false;
     tab.deletable = false;
     tab
 }
@@ -429,7 +478,7 @@ pub fn adapters_tab_from(adapter: Option<&BtAdapterInfo>) -> Tab {
             )],
         );
         tab.bare_rows = false;
-        tab.filterable = true;
+        tab.filterable = false;
         tab.deletable = false;
         return tab;
     };
@@ -509,7 +558,7 @@ pub fn adapters_tab_from(adapter: Option<&BtAdapterInfo>) -> Tab {
     let rows = vec![controller_row, disc_row, pair_row, scan_row];
     let mut tab = Tab::with_rows(TAB_ADAPTERS, rows);
     tab.bare_rows = false;
-    tab.filterable = true;
+    tab.filterable = false;
     tab.deletable = false;
     tab
 }
@@ -744,9 +793,18 @@ Device 00:1B:66:81:28:B4 MX Master 3S
         assert_eq!(tab.rows[0].label, "Turn Bluetooth Off");
 
         assert_eq!(tab.rows[1].label, "WH-1000XM4 F4:4E:FC:21:40:48");
-        assert_eq!(tab.rows[1].meta.as_deref(), Some("Connected (85%) · Audio"));
+        assert_eq!(
+            tab.rows[1].meta.as_deref(),
+            Some(" 85% [███████░] Connected · Audio")
+        );
         assert!(tab.rows[1].is_default);
-        assert_eq!(tab.rows[1].volume, Some(0.85));
+        assert_eq!(
+            tab.rows[1].volume, None,
+            "battery is a text gauge, row stays compact"
+        );
+        for row in &tab.rows {
+            assert_eq!(row.volume, None, "no volume bars: {}", row.label);
+        }
         assert_eq!(tab.rows[1].targets.len(), 6);
         assert_eq!(tab.rows[1].targets[0].title, "Connect");
         assert_eq!(tab.rows[1].targets[1].title, "Disconnect");

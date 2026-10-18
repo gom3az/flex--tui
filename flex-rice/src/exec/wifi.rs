@@ -1073,7 +1073,7 @@ mod tests {
 
     #[test]
     fn plan_snapshot_none_is_empty() {
-        assert!(plan(&PlannedAction::None).is_empty());
+        assert_eq!(plan(&PlannedAction::None), [] as [Step; 0]);
     }
 
     #[test]
@@ -1117,10 +1117,7 @@ mod tests {
         let mut err = Vec::new();
         let password = read_password_with("MyNet", "", tty, &mut stdin, &mut err);
         assert_eq!(password, "s3cret");
-        assert!(
-            err.is_empty(),
-            "no prompt bytes when the seam answers: {err:?}"
-        );
+        assert_eq!(err, b"", "no prompt bytes when the seam answers: {err:?}");
         match saved {
             Some(value) => std::env::set_var("FLEX_WIFI_PASSWORD", value),
             None => std::env::remove_var("FLEX_WIFI_PASSWORD"),

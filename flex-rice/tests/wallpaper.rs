@@ -251,7 +251,7 @@ fn duplicate_roots_and_repeated_files_are_deduped() {
 #[test]
 fn missing_roots_yield_no_rows_without_panicking() {
     let missing = scratch("missing").join("nope");
-    assert!(wallpaper::scan(std::slice::from_ref(&missing), None).is_empty());
+    assert_eq!(wallpaper::scan(std::slice::from_ref(&missing), None), []);
     assert!(wallpaper::resolve_in(&[missing], "0123456789abcdef").is_none());
 }
 
@@ -317,8 +317,9 @@ fn pane_region_stays_blank_and_the_list_narrows() {
     let pane = pane.expect("pane");
     for y in pane.y..pane.y + pane.height {
         let cells = row_text(&buf, y, 80);
-        assert!(
-            cells[pane.x as usize..].trim().is_empty(),
+        assert_eq!(
+            cells[pane.x as usize..].trim(),
+            "",
             "row {y} must leave the image pane empty: {cells:?}"
         );
     }
@@ -942,7 +943,7 @@ fn binary_errors_carry_a_single_prefix() {
         .output()
         .expect("run flex-wallpaper without a pty");
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty(), "no stdout on error");
+    assert_eq!(output.stdout, b"", "no stdout on error");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         stderr.starts_with("flex: error: "),

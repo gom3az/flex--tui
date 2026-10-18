@@ -180,6 +180,29 @@ fn proc_tab_enables_visible_search_and_deletable() {
 }
 
 #[test]
+fn proc_metas_carry_cpu_text_gauges_and_stay_compact() {
+    let tab = flex_rice::providers::proc::proc_tab();
+    assert!(!tab.rows.is_empty(), "proc menu has rows");
+    for row in &tab.rows {
+        let meta = row.meta.as_deref().expect("proc row carries a meta");
+        assert!(
+            meta.contains('%') && meta.contains('[') && meta.contains(']'),
+            "wifi-style CPU gauge in meta: {row:?}"
+        );
+        assert_eq!(
+            row.volume, None,
+            "gauge is text, row stays compact: {row:?}"
+        );
+        if row.id.as_str().starts_with("service:") {
+            assert!(
+                row.hide_target_in_header,
+                "aggregate totals own the service header: {row:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn service_toggle_expands_and_collapses() {
     let svc = "test-service.service";
     assert!(!flex_rice::providers::proc::is_service_expanded(svc));

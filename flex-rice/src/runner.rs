@@ -424,8 +424,7 @@ pub fn build_menu(provider: Provider, style: StyleOptions) -> Result<Menu> {
             .iter()
             .any(|tab| tab.filterable && tab.learnable)
     {
-        let all = crate::usage::load_all(None);
-        built.app.usage = crate::usage::load_provider(&all, &built.provider);
+        built.app.usage = crate::usage::load_one(&built.provider, None);
     }
     Ok(built)
 }

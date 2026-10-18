@@ -246,21 +246,32 @@ pub fn find_exec_in(dirs: &[PathBuf], id: &str) -> Option<(String, bool)> {
 /// The regex is `sed -E 's/ %[A-Za-z]//g; s/^ *//; s/ *$//'`.
 #[must_use]
 pub fn strip_field_codes(exec: &str) -> String {
-    let chars: Vec<char> = exec.chars().collect();
+    // Byte scan without the old `chars().collect::<Vec<char>>`: field codes
+    // are ASCII (`" %X"`), so operate on bytes and only decode once via the
+    // output `String`. Non-ASCII bytes pass through untouched.
+    let bytes = exec.as_bytes();
     let mut out = String::with_capacity(exec.len());
     let mut index = 0_usize;
-    while index < chars.len() {
-        let is_code = chars[index] == ' '
-            && chars.get(index + 1) == Some(&'%')
-            && chars.get(index + 2).is_some_and(char::is_ascii_alphabetic);
+    while index < bytes.len() {
+        let is_code = bytes[index] == b' '
+            && bytes.get(index + 1) == Some(&b'%')
+            && bytes.get(index + 2).is_some_and(u8::is_ascii_alphabetic);
         if is_code {
             index += 3;
         } else {
-            out.push(chars[index]);
-            index += 1;
+            // ASCII fast path; multibyte sequences are pushed as whole chars.
+            let c = exec[index..].chars().next().unwrap_or(' ');
+            out.push(c);
+            index += c.len_utf8();
         }
     }
-    out.trim_matches(' ').to_string()
+    // Trim without a second alloc when already trimmed.
+    let trimmed = out.trim_matches(' ');
+    if trimmed.len() == out.len() {
+        out
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Sorted `.desktop` (`*.desktop`, filename order) files under `dir`.

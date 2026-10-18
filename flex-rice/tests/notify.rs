@@ -35,9 +35,6 @@ fn mock_state() -> NotifyState {
         until: 2500,
         total_secs: 1500,
     };
-    state.controls.night_light = true;
-    state.controls.caffeine = false;
-    state.controls.mic_muted = false;
     state.controls.mpris = Some(MprisTrack {
         player: "spotify".to_string(),
         title: "Get Lucky".to_string(),
@@ -153,33 +150,6 @@ fn feed_tab_contract_and_wiremix_rows() {
 }
 
 #[test]
-fn channels_tab_groups_by_app() {
-    let state = mock_state();
-    let tab = provider::channels_tab_from(&state, 1000);
-
-    assert_eq!(tab.name, provider::TAB_CHANNELS);
-    assert!(!tab.filterable);
-    // 4 channel headers (Discord, PackageKit, Slack, System) + 3 active child notification rows = 7 rows
-    assert_eq!(tab.rows.len(), 7);
-    assert!(tab
-        .rows
-        .iter()
-        .any(|r| r.label.contains("Discord (1 active)")));
-    assert!(tab
-        .rows
-        .iter()
-        .any(|r| r.label.contains("PackageKit (1 active)")));
-    assert!(tab
-        .rows
-        .iter()
-        .any(|r| r.label.contains("System (1 active)")));
-    assert!(tab
-        .rows
-        .iter()
-        .any(|r| r.sublabel.as_deref() == Some("#dev-team")));
-}
-
-#[test]
 fn feed_tab_groups_multi_notification_apps() {
     let mut state = mock_state();
     // Add a second Discord notification to trigger group header stack
@@ -269,16 +239,22 @@ fn notification_preview_carries_body_and_image() {
 }
 
 #[test]
-fn focus_tab_has_presets_and_status() {
+fn quick_controls_carries_focus_presets_and_timer_progress() {
     let state = mock_state();
-    let tab = provider::focus_tab_from(&state, 1000);
+    let tab = provider::feed_tab_from(&state, 1000);
+    let quick = &tab.rows[0];
 
-    assert_eq!(tab.name, provider::TAB_FOCUS);
-    assert!(!tab.filterable);
-    assert_eq!(tab.rows.len(), 4);
-    assert_eq!(tab.rows[0].label, "Do Not Disturb: Active (Timer Running)");
-    assert!(tab.rows[0].volume.is_some());
-    assert_eq!(tab.rows[1].label, "Pomodoro Sprint (25m)");
+    assert_eq!(quick.id.as_str(), provider::ACTION_QUICK_CONTROLS);
+    assert!(
+        quick.volume.is_some(),
+        "Timed DND progress bar renders on Quick Controls"
+    );
+    let target_ids: Vec<&str> = quick.targets.iter().map(|t| t.id.as_str()).collect();
+    assert!(target_ids.contains(&"dnd:25m"));
+    assert!(target_ids.contains(&"dnd:60m"));
+    assert!(target_ids.contains(&"dnd:120m"));
+    assert!(target_ids.contains(&"dnd:indefinite"));
+    assert!(target_ids.contains(&"dnd:off"));
 }
 
 #[test]
@@ -298,15 +274,16 @@ fn history_tab_renders_dismissed_archive() {
 fn golden_80x24_rendering_drawer_wiremix_detail() {
     let state = mock_state();
     let mut menu = provider::menu_from(&state, 1000);
+    assert_eq!(menu.app.tabs.len(), 2);
 
     let buf = draw(&mut menu, 80, 24);
 
     // Tab bar on the bottom line (y = 23)
     let tab_bar = buffer_line(&buf, 23, 80);
-    assert!(tab_bar.contains("[Feed]"));
-    assert!(tab_bar.contains("Channels"));
-    assert!(tab_bar.contains("Focus/DND"));
+    assert!(tab_bar.contains("[Notifications]"));
     assert!(tab_bar.contains("History"));
+    assert!(!tab_bar.contains("Channels"));
+    assert!(!tab_bar.contains("Focus/DND"));
 
     // Entry 0 header (y = 1): Quick Controls Shelf
     let e0_header = buffer_line(&buf, 1, 80);

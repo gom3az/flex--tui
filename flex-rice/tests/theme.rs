@@ -141,7 +141,7 @@ fn missing_dirs_yield_no_rows_without_panicking() {
     let missing =
         std::env::temp_dir().join(format!("flex-theme-test-missing-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&missing);
-    assert!(theme_::scan_available(&missing, "").is_empty());
+    assert_eq!(theme_::scan_available(&missing, ""), []);
     assert_eq!(theme_::current_name_in(&missing), "");
 }
 
@@ -639,7 +639,7 @@ fn binary_errors_carry_a_single_prefix() {
         .output()
         .expect("run flex-theme without a pty");
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty(), "no stdout on error");
+    assert_eq!(output.stdout, b"", "no stdout on error");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         stderr.starts_with("flex: error: "),

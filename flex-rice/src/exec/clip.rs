@@ -831,20 +831,84 @@ fn notify(path_env: &str, summary: &str, body: &str) -> Result<()> {
 /// A non-zero `wl-paste` exit is not an error: the wrapper pipes through `tr`
 /// under `|| true`, so whatever stdout it produced is used.
 ///
+/// The wait is bounded ([`WL_PASTE_TIMEOUT`]): a wedged Wayland selection
+/// (dead owner, never-ending stream) blocks `wl-paste` forever, and the
+/// unbounded `.output()` wait wedged `flex-clip add` under `wl-paste --watch`
+/// for 14 h (Sep 2026 incident — the watcher's serial spawn meant every later
+/// copy was silently dropped). A timeout is an error, never a partial entry:
+/// the next selection change spawns a fresh `add`.
+/// Large pastes are drained on a side thread: entries can exceed the 64 KiB
+/// pipe buffer (an 84 KiB line sits in the reference store), so waiting
+/// without draining would deadlock a healthy paste.
+///
 /// # Errors
 ///
-/// When `wl-paste` is missing from `path_env` or the spawn itself fails.
+/// When `wl-paste` is missing from `path_env`, the spawn itself fails, the
+/// child cannot be reaped, its output cannot be collected, or it does not
+/// exit in time.
 fn read_clipboard(path_env: &str) -> Result<String> {
+    read_clipboard_with(path_env, WL_PASTE_TIMEOUT)
+}
+
+/// Bound on one `wl-paste` paste: local IPC answers in milliseconds, so this
+/// only ever fires on a wedged selection.
+const WL_PASTE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Grace for the drain thread to hand over stdout after the child exits.
+const WL_PASTE_DRAIN: Duration = Duration::from_secs(2);
+/// Poll interval while waiting for `wl-paste` (the popup poll's 50 ms step).
+const WL_PASTE_POLL: Duration = Duration::from_millis(50);
+
+/// [`read_clipboard`] with an explicit bound (the test seam).
+///
+/// # Errors
+///
+/// As [`read_clipboard`].
+fn read_clipboard_with(path_env: &str, timeout: Duration) -> Result<String> {
     let Some(bin) = resolve_tool("wl-paste", path_env) else {
         anyhow::bail!("clip: wl-paste not found on PATH");
     };
-    let output = Command::new(&bin)
+    let mut child = Command::new(&bin)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output_retrying()
+        .spawn_retrying()
         .context("clip: failed to run wl-paste")?;
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let stdout = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut out) = stdout {
+            use std::io::Read as _;
+            let _ = out.read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if child
+            .try_wait()
+            .context("clip: failed to wait for wl-paste")?
+            .is_some()
+        {
+            // Exit status is deliberately ignored (see above); whatever
+            // stdout arrived is the entry.
+            match rx.recv_timeout(WL_PASTE_DRAIN) {
+                Ok(bytes) => {
+                    return Ok(String::from_utf8_lossy(&bytes).into_owned());
+                }
+                Err(_) => anyhow::bail!("clip: wl-paste output unreadable"),
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "clip: wl-paste timed out after {}s (clipboard owner not answering; re-copy to retry)",
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(WL_PASTE_POLL);
+    }
 }
 
 /// Decode the current-entry file the way `read_current` does: strip `NUL`s,
@@ -1203,7 +1267,7 @@ mod tests {
             vec![b"a".as_slice(), b"b".as_slice()]
         );
         assert_eq!(store_lines(b"a\nb"), vec![b"a".as_slice(), b"b".as_slice()]);
-        assert!(store_lines(b"").is_empty());
+        assert_eq!(store_lines(b""), [] as [&[u8]; 0]);
     }
 
     #[test]
@@ -1278,6 +1342,57 @@ mod tests {
         add_with("\n", &hist, &current, &pins, &ts, None).expect("add");
         assert!(!hist.exists());
         assert!(!current.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Install an executable `wl-paste` stub with `body` in `dir` and return
+    /// the dir as a `PATH` value (so `read_clipboard` resolves the stub).
+    fn paste_stub(dir: &Path, body: &str) -> String {
+        let stub = dir.join("wl-paste");
+        std::fs::write(&stub, body).expect("write wl-paste stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod wl-paste stub");
+        }
+        dir.display().to_string()
+    }
+
+    #[test]
+    fn read_clipboard_times_out_on_a_hung_paste() {
+        // Live incident (Sep 2026): a wedged Wayland selection blocked
+        // `wl-paste` forever and the unbounded wait wedged `flex-clip add`
+        // under `wl-paste --watch` for 14 h, silently dropping every later
+        // copy. The wait must be bounded.
+        let dir = scratch("hung-paste");
+        let path_env = paste_stub(&dir, "#!/bin/sh\nsleep 30\n");
+        let start = std::time::Instant::now();
+        let err = read_clipboard_with(&path_env, Duration::from_millis(300))
+            .expect_err("a hung paste must fail, not hang");
+        assert!(
+            err.to_string().contains("timed out"),
+            "the timeout must say so: {err:#}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "bounded wait, not the stub's 30 s"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_clipboard_drains_pastes_bigger_than_the_pipe_buffer() {
+        // Entries can exceed the 64 KiB pipe buffer (84 KiB in the reference
+        // store): stdout must drain concurrently with the wait, or a healthy
+        // large paste deadlocks against a full pipe.
+        let dir = scratch("big-paste");
+        let path_env = paste_stub(
+            &dir,
+            "#!/bin/sh\nhead -c 100000 /dev/zero | tr '\\000' 'x'\n",
+        );
+        let got = read_clipboard(&path_env).expect("big paste reads");
+        assert_eq!(got.len(), 100_000, "every byte drained");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

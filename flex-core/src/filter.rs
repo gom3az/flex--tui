@@ -180,6 +180,31 @@ fn score_folded(needle: &[char], haystack: &str) -> Option<(u16, Vec<u32>)> {
 fn score_into(needle: &[char], hay: &[char], positions: &mut Vec<u32>) -> Option<u16> {
     debug_assert!(!needle.is_empty(), "empty needle is handled by the caller");
     positions.clear();
+    // Fast path: single-char needles skip the word-prefix scan entirely.
+    // The greedy first hit decides the tier (prefix / boundary / scattered).
+    if needle.len() == 1 {
+        let wanted = needle[0];
+        // Tier 1: prefix (hay starts with needle).
+        if !hay.is_empty() && hay[0] == wanted {
+            positions.push(0);
+            return Some(apply_penalties(TIER_PREFIX, 0, 0));
+        }
+        let mut first = None;
+        for (index, &got) in hay.iter().enumerate() {
+            if got == wanted {
+                first = Some(index);
+                break;
+            }
+        }
+        let at = first?;
+        positions.push(u32::try_from(at).unwrap_or(u32::MAX));
+        let tier = if is_word_start(hay, at) {
+            TIER_WORD_BOUNDARY
+        } else {
+            TIER_SCATTERED
+        };
+        return Some(apply_penalties(tier, at, 0));
+    }
     // Tier 1: full prefix.
     if hay.starts_with(needle) {
         positions.extend((0..needle.len()).map(|i| u32::try_from(i).unwrap_or(u32::MAX)));
@@ -201,12 +226,16 @@ fn score_into(needle: &[char], hay: &[char], positions: &mut Vec<u32>) -> Option
     let mut cursor = 0_usize;
     for &wanted in needle {
         let mut found = None;
-        for (index, &got) in hay.iter().enumerate().skip(cursor) {
-            if got == wanted {
+        // Manual index loop: cheaper than `enumerate().skip(cursor)` and
+        // lets the compiler bound-check once per row.
+        let mut index = cursor;
+        while index < hay.len() {
+            if hay[index] == wanted {
                 found = Some(index);
                 cursor = index + 1;
                 break;
             }
+            index += 1;
         }
         positions.push(u32::try_from(found?).unwrap_or(u32::MAX));
     }
@@ -268,7 +297,9 @@ fn rank_all_inner(needle: &str, rows: &[Row], usage: Option<(&UsageTable, u64)>)
         return hits;
     }
     let folded_needle: Vec<char> = lowercase_chars(needle);
-    let mut hits: Vec<RankedHit> = Vec::new();
+    // Upper-bound reserve: at most one hit per row; avoids regrow on
+    // broad queries like "a" over the 3200-row corpus.
+    let mut hits: Vec<RankedHit> = Vec::with_capacity(rows.len());
     let mut folded_hay: Vec<char> = Vec::new();
     let mut positions: Vec<u32> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
@@ -327,18 +358,19 @@ pub fn rank_all_legacy(needle: &str, rows: &[Row]) -> Vec<RankedHit> {
 
 /// Empty-needle hits: every row in provider order (no scoring).
 fn empty_hits(rows: &[Row]) -> Vec<RankedHit> {
-    rows.iter()
-        .enumerate()
-        .map(|(index, _)| RankedHit {
-            index,
-            score: EMPTY_NEEDLE_SCORE,
-            positions: Vec::new(),
-        })
-        .collect()
+    let mut hits = Vec::with_capacity(rows.len());
+    hits.extend(rows.iter().enumerate().map(|(index, _)| RankedHit {
+        index,
+        score: EMPTY_NEEDLE_SCORE,
+        positions: Vec::new(),
+    }));
+    hits
 }
 
 fn lowercase_chars(text: &str) -> Vec<char> {
-    text.to_lowercase().chars().collect()
+    // Single pass: stream `to_lowercase` straight into the Vec instead of
+    // `to_lowercase() -> String -> chars().collect()` (two allocs).
+    text.chars().flat_map(char::to_lowercase).collect()
 }
 
 /// Whether `needle` is a case-insensitive ordered subsequence of `haystack`.
@@ -534,14 +566,26 @@ fn hit_frecency(hit: &RankedHit, rows: &[Row], usage: &UsageTable, now: u64) -> 
 /// index ascending (stable, deterministic).
 fn sort_hits(hits: &mut [RankedHit], rows: &[Row], usage: Option<(&UsageTable, u64)>) {
     match usage {
-        Some((table, now)) => hits.sort_by(|a, b| {
-            b.score
-                .cmp(&a.score)
-                .then_with(|| {
-                    hit_frecency(b, rows, table, now).total_cmp(&hit_frecency(a, rows, table, now))
-                })
-                .then_with(|| a.index.cmp(&b.index))
-        }),
+        Some((table, now)) => {
+            // Pre-resolve frecency once per hit: the old comparator did two
+            // `HashMap<String,_>` lookups per comparison (O(log n) lookups
+            // per hit). Cache scores in a side table indexed by position.
+            let mut frecency: Vec<f64> = Vec::with_capacity(hits.len());
+            frecency.extend(hits.iter().map(|hit| hit_frecency(hit, rows, table, now)));
+            // Sort indices to keep `hits` move-cheap, then reorder in place.
+            let mut order: Vec<usize> = (0..hits.len()).collect();
+            order.sort_by(|&a, &b| {
+                hits[b]
+                    .score
+                    .cmp(&hits[a].score)
+                    .then_with(|| frecency[b].total_cmp(&frecency[a]))
+                    .then_with(|| hits[a].index.cmp(&hits[b].index))
+            });
+            // Apply permutation via a single clone of the slice (one alloc,
+            // no per-compare HashMap traffic).
+            let sorted: Vec<RankedHit> = order.into_iter().map(|i| hits[i].clone()).collect();
+            hits.clone_from_slice(&sorted);
+        }
         None => hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.index.cmp(&b.index))),
     }
 }

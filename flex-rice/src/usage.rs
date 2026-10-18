@@ -58,8 +58,12 @@ pub fn load_all(path_env: Option<&str>) -> AllUsage {
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let mut all: AllUsage = HashMap::new();
     for line in text.lines() {
-        let fields: Vec<&str> = line.split('\t').collect();
-        let [provider, rank, last, id] = fields.as_slice() else {
+        // No `split().collect::<Vec>()` per line: destructure the four
+        // fields directly (one pass, no alloc).
+        let mut fields = line.split('\t');
+        let (Some(provider), Some(rank), Some(last), Some(id)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
             continue;
         };
         let (Ok(rank), Ok(last)) = (rank.parse::<f64>(), last.parse::<u64>()) else {
@@ -68,8 +72,8 @@ pub fn load_all(path_env: Option<&str>) -> AllUsage {
         if provider.is_empty() || id.is_empty() || !rank.is_finite() {
             continue;
         }
-        all.entry((*provider).to_owned()).or_default().insert(
-            (*id).to_owned(),
+        all.entry(provider.to_owned()).or_default().insert(
+            id.to_owned(),
             filter::UsageEntry {
                 rank: rank.max(0.0),
                 last_accessed: last,
@@ -83,6 +87,45 @@ pub fn load_all(path_env: Option<&str>) -> AllUsage {
 #[must_use]
 pub fn load_provider(all: &AllUsage, provider: &str) -> UsageTable {
     all.get(provider).cloned().unwrap_or_default()
+}
+
+/// Load only `provider`'s rows in one pass (popup-open fast path).
+///
+/// [`load_all`] + [`load_provider`] builds every provider's table then clones
+/// one; this parses the same file but keeps only matching lines — no
+/// `AllUsage` map and no clone. Malformed lines are skipped identically.
+#[must_use]
+pub fn load_one(provider: &str, path_env: Option<&str>) -> UsageTable {
+    let path = usage_path(path_env);
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut table = UsageTable::new();
+    for line in text.lines() {
+        // Split without `collect::<Vec>`: provider is the first field, so
+        // non-matching lines skip parsing rank/last/id entirely.
+        let mut fields = line.split('\t');
+        let (Some(row_provider), Some(rank), Some(last), Some(id)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if row_provider != provider || row_provider.is_empty() || id.is_empty() {
+            continue;
+        }
+        let (Ok(rank), Ok(last)) = (rank.parse::<f64>(), last.parse::<u64>()) else {
+            continue;
+        };
+        if !rank.is_finite() {
+            continue;
+        }
+        table.insert(
+            id.to_owned(),
+            filter::UsageEntry {
+                rank: rank.max(0.0),
+                last_accessed: last,
+            },
+        );
+    }
+    table
 }
 
 /// Save the whole store atomically (`.tmp` + rename), creating parent dirs.

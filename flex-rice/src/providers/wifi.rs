@@ -213,6 +213,26 @@ pub fn wifi_rows(nets: &[WifiNet]) -> Vec<Row> {
 /// panic.
 #[must_use]
 pub fn bar(val: i64, max: i64, width: usize) -> String {
+    // Memoized 0-100/width-8 fast path: every wifi tick renders one bar per
+    // network, and signals only take 101 values. Other shapes fall through
+    // to the general builder below.
+    if max == 100 && width == 8 && (0..=100).contains(&val) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let signal = val as usize;
+        return cached_bar(signal).clone();
+    }
+    build_bar(val, max, width)
+}
+
+/// Cached `[████░░░░]` strings for signals 0-100 (width 8).
+fn cached_bar(signal: usize) -> &'static String {
+    use std::sync::OnceLock;
+    static BARS: OnceLock<Vec<String>> = OnceLock::new();
+    let bars = BARS.get_or_init(|| (0..=100).map(|v| build_bar(i64::from(v), 100, 8)).collect());
+    &bars[signal.min(100)]
+}
+
+fn build_bar(val: i64, max: i64, width: usize) -> String {
     let max = max.max(1);
     let clamped = val.clamp(0, max);
     let slots = i64::try_from(width).unwrap_or(i64::MAX);
@@ -829,7 +849,7 @@ Wired:802-3-ethernet\n:802-11-wireless\n";
             vec!["gom3a-5g".to_string(), "My:Net".to_string()],
             "wifi profiles only, names unescaped, empty names skipped"
         );
-        assert!(parse_saved_profiles("").is_empty());
+        assert_eq!(parse_saved_profiles(""), [] as [String; 0]);
     }
 
     #[test]

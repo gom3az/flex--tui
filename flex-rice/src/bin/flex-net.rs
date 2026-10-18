@@ -9,7 +9,7 @@ use std::time::Duration;
 use clap::Parser;
 use flex_core::backend::EXIT_CANCELLED;
 use flex_core::Outcome;
-use flex_rice::exec::net::{self, format_speed, scan_top_talkers};
+use flex_rice::exec::net::{self, format_speed, snapshot_bandwidth};
 use flex_rice::exec::speedtest;
 use flex_rice::runner::{self, GlobalStyle, Provider};
 
@@ -54,6 +54,46 @@ async fn main() {
     }
 }
 
+/// Headless top talkers: interface total, TCP-attributed table, remainder.
+fn print_top() {
+    let snapshot = snapshot_bandwidth();
+    if let Some((iface, rx_rate, tx_rate)) = snapshot.iface.as_ref() {
+        println!(
+            "{iface}: ⬇ {}  ⬆ {}  (interface total, matches waybar)",
+            format_speed(*rx_rate),
+            format_speed(*tx_rate)
+        );
+    }
+    if snapshot.talkers.is_empty() {
+        println!("No attributed TCP processes found.");
+    } else {
+        println!(
+            "{:<8} {:<20} {:<15} {:<15} {:<8}",
+            "PID", "COMMAND", "RX RATE", "TX RATE", "SHARE"
+        );
+        for process in &snapshot.talkers {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let share_pct = (process.share * 100.0).round() as u32;
+            println!(
+                "{:<8} {:<20} {:<15} {:<15} {:>3}%",
+                process.pid,
+                process.comm,
+                format_speed(process.rx_rate),
+                format_speed(process.tx_rate),
+                share_pct
+            );
+        }
+    }
+    let (unattributed_rx, unattributed_tx) = snapshot.unattributed;
+    if unattributed_rx > 0.0 || unattributed_tx > 0.0 {
+        println!(
+            "unattributed (UDP/short-lived/kernel): ⬇ {}  ⬆ {}",
+            format_speed(unattributed_rx),
+            format_speed(unattributed_tx)
+        );
+    }
+}
+
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -62,27 +102,7 @@ async fn run() -> anyhow::Result<()> {
     }
 
     if cli.top {
-        let talkers = scan_top_talkers();
-        if talkers.is_empty() {
-            println!("No active network consuming processes found.");
-        } else {
-            println!(
-                "{:<8} {:<20} {:<15} {:<15} {:<8}",
-                "PID", "COMMAND", "RX RATE", "TX RATE", "SHARE"
-            );
-            for p in &talkers {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let share_pct = (p.share * 100.0).round() as u32;
-                println!(
-                    "{:<8} {:<20} {:<15} {:<15} {:>3}%",
-                    p.pid,
-                    p.comm,
-                    format_speed(p.rx_rate),
-                    format_speed(p.tx_rate),
-                    share_pct
-                );
-            }
-        }
+        print_top();
         return Ok(());
     }
 
@@ -146,8 +166,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }
-    } else {
-        println!("{}", net::sample_json());
-        Ok(())
     }
+    println!("{}", net::sample_json());
+    Ok(())
 }
