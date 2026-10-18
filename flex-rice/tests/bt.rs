@@ -159,7 +159,7 @@ fn devices_tab_exact_wiremix_contract() {
 
     assert_eq!(tab.name, bt::TAB_DEVICES);
     assert!(!tab.bare_rows);
-    assert!(tab.filterable);
+    assert!(!tab.filterable);
     assert_eq!(tab.rows.len(), 4);
 
     assert_eq!(tab.rows[0].id.as_str(), bt::POWER_OFF_ID);
@@ -168,9 +168,15 @@ fn devices_tab_exact_wiremix_contract() {
 
     let r1 = &tab.rows[1];
     assert_eq!(r1.label, "WH-1000XM4 F4:4E:FC:21:40:48");
-    assert_eq!(r1.meta.as_deref(), Some("Connected (85%) · Audio"));
+    assert_eq!(
+        r1.meta.as_deref(),
+        Some(" 85% [███████░] Connected · Audio")
+    );
     assert!(r1.is_default);
-    assert_eq!(r1.volume, Some(0.85));
+    assert_eq!(
+        r1.volume, None,
+        "battery is a text gauge, row stays compact"
+    );
     assert_eq!(r1.targets.len(), 6);
     assert_eq!(r1.targets[0].title, "Connect");
     assert_eq!(r1.targets[1].title, "Disconnect");
@@ -234,21 +240,29 @@ fn golden_80x24_rendering_wiremix_detail() {
     assert!(tab_bar.contains("[Devices]"));
     assert!(tab_bar.contains("Adapters"));
 
-    // Entry 0 header (y = 4): "Turn Bluetooth Off" (margin at y=0, filter at y=1, separator at y=2, indicator at y=3)
-    let e0_header = buffer_line(&buf, 4, 80);
+    // No filter line (filterable = false): entry 0 header is at y = 1
+    let e0_header = buffer_line(&buf, 1, 80);
     assert!(e0_header.contains("░"));
     assert!(e0_header.contains("Turn Bluetooth Off"));
 
-    // Pitch for 3-line nodes with detail: Entry 1 header is at y = 9 (4 + 5)
-    let e1_header = buffer_line(&buf, 9, 80);
+    // Compact pitch (1-line rows + 1 spacing): entry 1 header is at y = 3.
+    // `hide_target_in_header` shows the battery/status meta (not the
+    // Connect/Disconnect target, which lives in the dropdown).
+    let e1_header = buffer_line(&buf, 3, 80);
     assert!(e1_header.contains("◇"));
     assert!(e1_header.contains("WH-1000XM4"));
-    assert!(e1_header.contains("Disconnect"));
 
-    // Detail line for entry 1 (y = 11): Battery percentage bar
-    let e1_detail = buffer_line(&buf, 11, 80);
-    assert!(e1_detail.contains("85%"));
-    assert!(e1_detail.contains("━"));
+    // Compact battery gauge lives in the header meta, not a detail line.
+    assert!(e1_header.contains("85%"));
+    assert!(e1_header.contains("█"));
+    let mut all = String::new();
+    for y in 0..24 {
+        all.push_str(&buffer_line(&buf, y, 80));
+    }
+    assert!(
+        !all.contains("━"),
+        "no volume-bar detail lines in compact mode"
+    );
 
     menu.app.switch_tab(1);
     let buf_adapters = draw(&mut menu, 80, 24);

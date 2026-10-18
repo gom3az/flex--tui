@@ -115,6 +115,9 @@ enum Command {
         /// Print the selected `ACTION:` line without executing it.
         #[arg(long)]
         print_action: bool,
+        /// Output JSON status for Waybar polling (no TUI).
+        #[arg(long = "status")]
+        status: bool,
     },
     /// Notification Center drawer.
     Notify {
@@ -263,7 +266,16 @@ fn run() -> Result<()> {
         Command::Net { print_action } => {
             reexec(Provider::Net, style, *print_action, &[String::from("-m")])
         }
-        Command::Bt { print_action } => reexec(Provider::Bt, style, *print_action, &[]),
+        Command::Bt {
+            print_action,
+            status,
+        } => {
+            let mut extra = Vec::new();
+            if *status {
+                extra.push(String::from("--status"));
+            }
+            reexec(Provider::Bt, style, *print_action, &extra)
+        }
         Command::Notify { print_action } => reexec(
             Provider::Notify,
             style,

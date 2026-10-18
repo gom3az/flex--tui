@@ -246,12 +246,20 @@ fn bandwidth_tab_rows_carry_volume_metrics() {
     assert!(tab.filterable);
     assert!(tab.deletable);
     for row in &tab.rows {
+        // Compact rows: the wire share lives in `meta` as a wifi-style text
+        // gauge, never in `Row::volume` (which would force 3-line nodes).
+        assert_eq!(row.volume, None, "compact text gauge: {row:?}");
         let id = row.id.as_str();
         if id == "noop" || id.starts_with("iface:") {
             continue;
         }
-        assert!(row.volume.is_some(), "row has volume metric: {row:?}");
         assert!(row.confirmable, "row is confirmable: {row:?}");
+        let meta = row.meta.as_deref().expect("talker meta");
+        assert!(meta.contains('%'), "share pct: {row:?}");
+        assert!(
+            meta.contains('[') && meta.contains(']'),
+            "share bar: {row:?}"
+        );
     }
 }
 
@@ -326,7 +334,15 @@ fn bandwidth_rows_from_fabricated_snapshot() {
     assert!(rows[0].volume.is_none());
     assert_eq!(rows[1].id.as_str(), "proc:2237");
     assert!(rows[1].confirmable, "kill actions still armed");
-    assert_eq!(rows[1].volume, Some(0.46));
+    assert_eq!(
+        rows[1].volume, None,
+        "share is a text gauge, row stays compact"
+    );
+    let talker_meta = rows[1].meta.as_deref().expect("talker meta");
+    assert!(
+        talker_meta.contains("46%") && talker_meta.contains("[████░░░░]"),
+        "wire-share gauge in meta: {talker_meta:?}"
+    );
     assert_eq!(rows[2].id.as_str(), "noop");
     assert!(rows[2].label.contains("unattributed"), "{:?}", rows[2]);
     assert!(!rows[2].confirmable);

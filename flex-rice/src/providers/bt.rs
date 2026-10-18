@@ -4,8 +4,10 @@
 //! - Tab 1: `[Devices]`
 //!   - Top row: Bluetooth power toggle (`Turn Bluetooth Off / On`).
 //!   - Device rows: `<name> <mac>`, marker `◇` on connected audio sink, meta
-//!     `Connected (85%) · Audio` or `Available (-64 dBm)`, `Row::volume`
-//!     battery percentage bar (e.g. 0.85 -> 85% ━━━━━━╌╌).
+//!     `85% [███████░] Connected · Audio` or `Available (-64 dBm)` —
+//!     battery renders as a wifi-style text gauge in `meta`, never as
+//!     `Row::volume`, so every row stays 1-line compact like the wifi
+//!     picker.
 //!   - Dropdown targets: Connect, Disconnect, Set as Default Audio Sink,
 //!     Switch to High Quality (A2DP), Switch to Headset Mode (HFP), Unpair (Forget Device).
 //! - Tab 2: `[Adapters]`
@@ -295,7 +297,12 @@ fn contains_ascii_insensitive(haystack: &str, needle: &str) -> bool {
     false
 }
 
-/// Construct the meta string for a device row matching Wiremix conventions.
+/// Construct the meta string for a device row, wifi-compact style.
+///
+/// Connected rows with a known battery lead with a text gauge
+/// (`85% [███████░]`); rows without a battery keep the plain status text.
+/// Compact by construction: the gauge lives in `meta`, never in
+/// `Row::volume`, so the row renders 1-line.
 #[must_use]
 pub fn build_device_meta(
     connected: bool,
@@ -306,8 +313,16 @@ pub fn build_device_meta(
 ) -> String {
     if connected {
         match (battery, is_audio) {
-            (Some(b), true) => format!("Connected ({b}%) · Audio"),
-            (Some(b), false) => format!("Connected ({b}%)"),
+            (Some(b), true) => format!(
+                "{b:>3}% {} Connected · Audio",
+                super::wifi::bar(i64::from(b), 100, 8)
+            ),
+            (Some(b), false) => {
+                format!(
+                    "{b:>3}% {} Connected",
+                    super::wifi::bar(i64::from(b), 100, 8)
+                )
+            }
             (None, true) => String::from("Connected · Audio"),
             (None, false) => String::from("Connected"),
         }
@@ -346,10 +361,11 @@ pub fn build_device_row(
     let id = RowId::new(format!("device:{mac}"));
     let mut row = Row::with_meta(id, label, meta);
     row.is_default = is_default;
-
-    if let Some(pct) = battery {
-        row.volume = Some(f32::from(pct) / 100.0);
-    }
+    // Rows with targets render the current target (Connect/Disconnect) in
+    // the header right column instead of `meta`; hide it so the battery
+    // gauge + status in `meta` stays visible on the 1-line compact row
+    // (the dropdown still lists every target).
+    row.hide_target_in_header = true;
 
     let mut sink_target = Target::new(
         RowId::new(format!("sink:{mac}")),
@@ -416,7 +432,7 @@ pub fn devices_tab_from(
             )],
         );
         tab.bare_rows = false;
-        tab.filterable = true;
+        tab.filterable = false;
         tab.deletable = false;
         return tab;
     }
@@ -445,7 +461,7 @@ pub fn devices_tab_from(
 
     let mut tab = Tab::with_rows(TAB_DEVICES, rows);
     tab.bare_rows = false;
-    tab.filterable = true;
+    tab.filterable = false;
     tab.deletable = false;
     tab
 }
@@ -462,7 +478,7 @@ pub fn adapters_tab_from(adapter: Option<&BtAdapterInfo>) -> Tab {
             )],
         );
         tab.bare_rows = false;
-        tab.filterable = true;
+        tab.filterable = false;
         tab.deletable = false;
         return tab;
     };
@@ -542,7 +558,7 @@ pub fn adapters_tab_from(adapter: Option<&BtAdapterInfo>) -> Tab {
     let rows = vec![controller_row, disc_row, pair_row, scan_row];
     let mut tab = Tab::with_rows(TAB_ADAPTERS, rows);
     tab.bare_rows = false;
-    tab.filterable = true;
+    tab.filterable = false;
     tab.deletable = false;
     tab
 }
@@ -777,9 +793,18 @@ Device 00:1B:66:81:28:B4 MX Master 3S
         assert_eq!(tab.rows[0].label, "Turn Bluetooth Off");
 
         assert_eq!(tab.rows[1].label, "WH-1000XM4 F4:4E:FC:21:40:48");
-        assert_eq!(tab.rows[1].meta.as_deref(), Some("Connected (85%) · Audio"));
+        assert_eq!(
+            tab.rows[1].meta.as_deref(),
+            Some(" 85% [███████░] Connected · Audio")
+        );
         assert!(tab.rows[1].is_default);
-        assert_eq!(tab.rows[1].volume, Some(0.85));
+        assert_eq!(
+            tab.rows[1].volume, None,
+            "battery is a text gauge, row stays compact"
+        );
+        for row in &tab.rows {
+            assert_eq!(row.volume, None, "no volume bars: {}", row.label);
+        }
         assert_eq!(tab.rows[1].targets.len(), 6);
         assert_eq!(tab.rows[1].targets[0].title, "Connect");
         assert_eq!(tab.rows[1].targets[1].title, "Disconnect");

@@ -25,6 +25,13 @@ pub const TAB_SPEEDTEST: &str = "Speedtest";
 
 pub const SPEEDTEST_RUN_ID: &str = "speedtest:run";
 
+/// Wire-share percentage for a compact text gauge (0–100, rounded).
+fn share_pct(share: f32) -> i64 {
+    #[allow(clippy::cast_possible_truncation)]
+    let pct = (f64::from(share) * 100.0).round() as i64;
+    pct.clamp(0, 100)
+}
+
 /// Build the `Bandwidth` tab: interface total, TCP-attributed processes,
 /// and the unattributed remainder.
 #[must_use]
@@ -45,11 +52,15 @@ pub fn bandwidth_tab() -> Tab {
 /// [`snapshot_bandwidth`](crate::exec::net::snapshot_bandwidth)).
 ///
 /// Row 0 is the interface total (same sampler as waybar, always agrees with
-/// the bar); process rows carry per-connection TCP rates with wire-share
-/// bars; the trailing `unattributed` row holds whatever the sockets don't
-/// explain (UDP/QUIC, churned or short-lived connections, kernel traffic).
+/// the bar); process rows carry per-connection TCP rates with a wifi-style
+/// wire-share text gauge in `meta` (`46% [████░░░░]`); the trailing
+/// `unattributed` row holds whatever the sockets don't explain (UDP/QUIC,
+/// churned or short-lived connections, kernel traffic).
 /// Process rows keep the `proc:<pid>` id so kill/signal actions still work;
 /// header and remainder ids are inert no-ops in `exec::net::execute`.
+///
+/// Compact by construction: no row sets `volume`/`config`/`detail`, so every
+/// row renders 1-line like the wifi picker (see `NodeMetrics::for_row`).
 #[must_use]
 pub fn build_bandwidth_rows(snapshot: &BandwidthSnapshot) -> Vec<Row> {
     use std::fmt::Write as _;
@@ -74,13 +85,14 @@ pub fn build_bandwidth_rows(snapshot: &BandwidthSnapshot) -> Vec<Row> {
         label.push(' ');
         let _ = write!(label, "{}", process.pid);
         let meta = format!(
-            "⬇ {}  ⬆ {}",
+            "{:>3}% {}  ⬇ {}  ⬆ {}",
+            share_pct(process.share),
+            super::wifi::bar(share_pct(process.share), 100, 8),
             format_speed(process.rx_rate),
             format_speed(process.tx_rate)
         );
         let mut row = Row::with_meta(id, label, meta);
         row.confirmable = true;
-        row.volume = Some(process.share);
         row
     }));
     let (unattributed_rx, unattributed_tx) = snapshot.unattributed;
@@ -89,20 +101,24 @@ pub fn build_bandwidth_rows(snapshot: &BandwidthSnapshot) -> Vec<Row> {
             .iface
             .as_ref()
             .map_or(0.0, |(_, rx_rate, tx_rate)| rx_rate + tx_rate);
-        let mut row = Row::with_meta(
+        #[allow(clippy::cast_possible_truncation)]
+        let share = if total > 0.0 {
+            ((unattributed_rx + unattributed_tx) / total).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let pct = (share * 100.0).round() as i64;
+        let row = Row::with_meta(
             RowId::new(providers::NOOP_ID),
             "unattributed (UDP · short-lived · kernel)",
             format!(
-                "⬇ {}  ⬆ {}",
+                "{pct:>3}% {}  ⬇ {}  ⬆ {}",
+                super::wifi::bar(pct, 100, 8),
                 format_speed(unattributed_rx),
                 format_speed(unattributed_tx)
             ),
         );
-        if total > 0.0 {
-            #[allow(clippy::cast_possible_truncation)]
-            let share = ((unattributed_rx + unattributed_tx) / total).clamp(0.0, 1.0) as f32;
-            row.volume = Some(share);
-        }
         rows.push(row);
     }
     if rows.is_empty() {

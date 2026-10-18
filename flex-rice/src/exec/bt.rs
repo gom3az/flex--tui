@@ -12,12 +12,14 @@
 //! - Default Audio Sink selection via `wpctl set-default` / `pactl set-default-sink`
 //! - Audio Profile switching (A2DP / HFP) via `pactl set-card-profile` / `wpctl set-profile`
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::Result;
 
 use crate::exec::NotifyWhen;
+use crate::providers::bt as provider;
 use crate::spawn::RetryExec as _;
 use crate::tools;
 
@@ -665,6 +667,112 @@ pub fn execute(action_id: &str, label: &str, path_override: Option<&str>) -> Res
     }
 
     anyhow::bail!("bt: unknown action id '{action_id}' (label: '{label}')");
+}
+
+/// Sample Bluetooth state and format Waybar JSON (`text`/`tooltip`/`class`).
+///
+/// Headless poller for `custom/bt` (`flex-bt --status`, 5 s `exec`): reuses the
+/// provider parsers and `$BT_*` snapshot seams, so fixture-driven tests pin the
+/// exact payload Waybar renders. Degrades to `off` JSON when the controller is
+/// missing or powered off — never an error, never non-JSON.
+#[must_use]
+pub fn status_json_from(
+    show_out: Option<&str>,
+    devices_out: Option<&str>,
+    info_fn: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    let adapter = show_out.and_then(provider::parse_controller);
+    let Some(info) = adapter else {
+        return serde_json::json!({
+            "text": "󰂲 off",
+            "tooltip": "No Bluetooth adapter\nClick to open manager",
+            "class": "off",
+        })
+        .to_string();
+    };
+    if !info.powered {
+        return serde_json::json!({
+            "text": "󰂲 off",
+            "tooltip": "Bluetooth off\nClick to open manager",
+            "class": "off",
+        })
+        .to_string();
+    }
+
+    let controller_label = if info.name.is_empty() {
+        info.mac.clone()
+    } else {
+        format!("{} ({})", info.name, info.mac)
+    };
+    let mut tooltip = format!("Controller {controller_label}");
+    let mut connected: Vec<String> = Vec::new();
+
+    if let Some(text) = devices_out {
+        let devices = provider::parse_devices(text);
+        if devices.is_empty() {
+            tooltip.push_str("\n(No Bluetooth devices)");
+        }
+        for (mac, name) in &devices {
+            let detail = info_fn(mac);
+            let detail_str = detail.as_deref().unwrap_or_default();
+            let is_connected = detail_str.contains("Connected: yes");
+            let battery = provider::parse_battery(detail_str);
+            let paired = detail_str.contains("Paired: yes");
+            let rssi = provider::parse_rssi(detail_str);
+            let is_audio = provider::is_audio_device(detail_str);
+            let meta = provider::build_device_meta(is_connected, battery, is_audio, rssi, paired);
+            let display = if name.is_empty() { mac } else { name };
+            let _ = write!(tooltip, "\n• {display} ({mac}): {meta}");
+            if is_connected {
+                connected.push(display.clone());
+            }
+        }
+    } else {
+        tooltip.push_str("\n(No Bluetooth devices)");
+    }
+    tooltip.push_str("\nClick to open manager");
+
+    // Text carries identity only (no battery %): the pill's pulseaudio half
+    // already shows a percentage (volume), and the battery lives in the tooltip.
+    let (text, class) = match connected.as_slice() {
+        [] => (String::from("󰂯 on"), String::from("on")),
+        [name] => (format!("󰂯 {name}"), String::from("connected")),
+        many => (
+            format!("󰂯 {} connected", many.len()),
+            String::from("connected"),
+        ),
+    };
+
+    serde_json::json!({
+        "text": text,
+        "tooltip": tooltip,
+        "class": class,
+    })
+    .to_string()
+}
+
+/// Live Waybar poller: snapshot `show`/`devices`/`info` (fixture seams first,
+/// live `bluetoothctl` otherwise) and render [`status_json_from`].
+#[must_use]
+pub fn status_json() -> String {
+    let show_out =
+        crate::providers::snapshot(provider::BT_SHOW_FILE_ENV, "bluetoothctl", &["show"]);
+    let devices_out =
+        crate::providers::snapshot(provider::BT_DEVICES_FILE_ENV, "bluetoothctl", &["devices"]);
+    let ambient = ambient_path();
+    status_json_from(show_out.as_deref(), devices_out.as_deref(), &|mac: &str| {
+        if let Ok(dir) = std::env::var(provider::BT_INFO_DIR_ENV) {
+            if dir.is_empty() {
+                return None;
+            }
+            if let Ok(body) = std::fs::read_to_string(std::path::Path::new(&dir).join(mac)) {
+                return Some(body);
+            }
+            return None;
+        }
+        let bt = bluetoothctl_cmd();
+        tool_captured(&ambient, &bt, &["info", mac])
+    })
 }
 
 #[cfg(test)]

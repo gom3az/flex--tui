@@ -19,6 +19,10 @@ struct Cli {
     /// Print the selected `ACTION:` line without executing it.
     #[arg(long)]
     print_action: bool,
+
+    /// Output JSON status for Waybar polling (no TUI, no popup).
+    #[arg(long = "status")]
+    status: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -31,6 +35,10 @@ async fn main() {
 
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.status {
+        println!("{}", bt::status_json());
+        return Ok(());
+    }
     let style = cli.style.options();
 
     runner::run_standard_cli(
