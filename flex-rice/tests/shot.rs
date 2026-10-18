@@ -419,8 +419,8 @@ fn worker_slurp_cancel_exits_130_quietly() {
     let rec = stubs.dir.join("rec");
     let output = run_capture_worker("area-shot", &file, &rec, &stubs, &[]);
     assert_eq!(output.status.code(), Some(130), "cancel exits 130");
-    assert!(output.stdout.is_empty(), "no stdout on cancel");
-    assert!(output.stderr.is_empty(), "no diagnostics on cancel");
+    assert_eq!(output.stdout, b"", "no stdout on cancel");
+    assert_eq!(output.stderr, b"", "no diagnostics on cancel");
     assert_eq!(call_lines(&stubs.log), vec![String::from("slurp")]);
     assert!(!file.exists(), "nothing is staged on cancel");
     let _ = std::fs::remove_dir_all(&stubs.dir);

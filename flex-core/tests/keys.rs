@@ -465,8 +465,9 @@ fn non_filterable_tab_ignores_typing_but_keeps_control_runes() {
     menu.app.active_tab_mut().expect("power tab").filterable = false;
     let out = handle_key(&mut menu, rune('x'), t0);
     assert_eq!(out, KeyOutcome::Consumed);
-    assert!(
-        menu.app.active_state().expect("state").filter.is_empty(),
+    assert_eq!(
+        menu.app.active_state().expect("state").filter,
+        "",
         "typing never lands in the filter on power"
     );
     let _ = handle_key(&mut menu, rune('?'), t0);

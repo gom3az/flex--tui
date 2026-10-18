@@ -166,8 +166,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }
-    } else {
-        println!("{}", net::sample_json());
-        Ok(())
     }
+    println!("{}", net::sample_json());
+    Ok(())
 }

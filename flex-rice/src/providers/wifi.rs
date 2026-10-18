@@ -849,7 +849,7 @@ Wired:802-3-ethernet\n:802-11-wireless\n";
             vec!["gom3a-5g".to_string(), "My:Net".to_string()],
             "wifi profiles only, names unescaped, empty names skipped"
         );
-        assert!(parse_saved_profiles("").is_empty());
+        assert_eq!(parse_saved_profiles(""), [] as [String; 0]);
     }
 
     #[test]

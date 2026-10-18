@@ -220,7 +220,7 @@ fn status_is_silent_and_exits_1_when_idle() {
     let info = dir.join("recording.info");
     let output = run(&dir, &info, &["status"]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

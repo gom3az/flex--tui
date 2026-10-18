@@ -207,7 +207,7 @@ fn missing_files_yield_no_rows_without_panicking() {
     let missing = scratch("missing");
     let _ = std::fs::remove_dir_all(&missing);
     assert!(clip::load_entries_in(&missing.join("h"), &missing.join("p")).is_empty());
-    assert!(clip::tab_from_entries(&[]).rows.is_empty());
+    assert_eq!(clip::tab_from_entries(&[]).rows, []);
 }
 
 #[test]
@@ -680,8 +680,9 @@ fn executor_copy_matrix_copies_decoded_bytes_through_wl_copy() {
         hist.as_bytes(),
         "copy never touches the history file"
     );
-    assert!(
-        std::fs::read(&pins_path).expect("pins").is_empty(),
+    assert_eq!(
+        std::fs::read(&pins_path).expect("pins"),
+        b"",
         "copy never touches the pins file"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -931,7 +932,7 @@ fn binary_errors_carry_a_single_prefix() {
         .expect("run flex-clip without a pty");
     let _ = std::fs::remove_dir_all(&home);
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty(), "no stdout on error");
+    assert_eq!(output.stdout, b"", "no stdout on error");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         stderr.starts_with("flex: error: "),

@@ -232,8 +232,9 @@ fn typing_is_ignored_enter_selects_focused() {
     assert_eq!(outcome, KeyOutcome::Select, "no filter: Enter selects");
     assert!(!menu.app.is_armed(), "nothing arms without navigation");
     assert_eq!(menu.app.focused_row().expect("row").id.as_str(), "lock");
-    assert!(
-        menu.app.active_state().expect("state").filter.is_empty(),
+    assert_eq!(
+        menu.app.active_state().expect("state").filter,
+        "",
         "filter stays empty"
     );
 }
@@ -670,7 +671,7 @@ fn binary_errors_carry_a_single_prefix() {
         .output()
         .expect("run flex-power without a pty");
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty(), "no stdout on error");
+    assert_eq!(output.stdout, b"", "no stdout on error");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         stderr.starts_with("flex: error: "),

@@ -882,7 +882,7 @@ fn binary_errors_carry_a_single_prefix() {
         .output()
         .expect("run flex-launch without a pty");
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty(), "no stdout on error");
+    assert_eq!(output.stdout, b"", "no stdout on error");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         stderr.starts_with("flex: error: "),

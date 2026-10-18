@@ -1267,7 +1267,7 @@ mod tests {
             vec![b"a".as_slice(), b"b".as_slice()]
         );
         assert_eq!(store_lines(b"a\nb"), vec![b"a".as_slice(), b"b".as_slice()]);
-        assert!(store_lines(b"").is_empty());
+        assert_eq!(store_lines(b""), [] as [&[u8]; 0]);
     }
 
     #[test]

@@ -415,8 +415,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }
-    } else {
-        run_waybar_status(state_path);
-        Ok(())
     }
+    run_waybar_status(state_path);
+    Ok(())
 }
