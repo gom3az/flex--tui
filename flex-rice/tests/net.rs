@@ -268,7 +268,7 @@ fn bandwidth_header_matches_waybar_sampler_and_is_inert() {
     // The header reuses `sample_interface_rates` (waybar's sampler), so it
     // can never disagree with the bar by construction.
     if let Some((iface, rx_rate, tx_rate)) = net::sample_interface_rates() {
-        assert!(!iface.is_empty());
+        assert_ne!(iface, "");
         assert!(rx_rate >= 0.0 && tx_rate >= 0.0);
         assert!(rx_rate.is_finite() && tx_rate.is_finite());
         let tab = net_provider::bandwidth_tab();
