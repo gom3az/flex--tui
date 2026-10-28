@@ -450,6 +450,40 @@ fn executor_app_rules_and_archive_disposal() {
 }
 
 #[test]
+fn executor_snoozes_then_wakes_a_notification() {
+    let dir = std::env::temp_dir().join(format!("flex-notify-test-snooze-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("state.json");
+
+    let mut item = NotificationItem::new(7, "Slack", "standup", "in 10", Urgency::Normal);
+    item.timestamp = 100;
+    let mut state = NotifyState::default();
+    state.notifications.push(item);
+    notify::save_state(&state, Some(&path)).expect("saved");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
+    provider::execute("snooze:15:7", "Snooze 15 Minutes", Some(&path)).expect("exec");
+    let snoozed = notify::load_state(Some(&path));
+    assert!(snoozed.notifications[0].is_snoozed_at(now));
+    assert!(!snoozed.notifications[0].is_active(now));
+    let feed = provider::feed_tab_from(&snoozed, now);
+    assert!(
+        feed.rows.iter().any(|r| r.id.as_str() == "unsnooze:7"),
+        "a sleeping row stays reachable from the drawer"
+    );
+
+    provider::execute("unsnooze:7", "Wake Now", Some(&path)).expect("exec");
+    let awake = notify::load_state(Some(&path));
+    assert!(!awake.notifications[0].is_snoozed);
+    assert!(awake.notifications[0].is_active(now));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn mpris_parser_handles_twitch_livestreams_and_youtube() {
     let twitch_line = "brave;;Playing;;Caliathlol;;CoC Comet Oracle - Grand Expeditions;;;;14798847;;9223372036854775807;;file:///tmp/.org.chromium.Chromium.Ir95Tl";
     let twitch = notify::parse_mpris_line(twitch_line).expect("parses twitch");

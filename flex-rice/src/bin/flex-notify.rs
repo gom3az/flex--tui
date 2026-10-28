@@ -197,6 +197,11 @@ fn run_waybar_status(state_path: Option<&Path>) {
         .collect();
 
     let unread_count = active.len();
+    let snoozed_count = state
+        .notifications
+        .iter()
+        .filter(|n| !n.is_dismissed && n.is_snoozed_at(now))
+        .count();
     let is_dnd = state.controls.dnd.is_active(now);
     let has_critical = active.iter().any(|n| n.urgency == Urgency::Critical);
 
@@ -214,7 +219,7 @@ fn run_waybar_status(state_path: Option<&Path>) {
         (String::from(" 󰂚 0"), "empty")
     };
 
-    let tooltip = if unread_count == 0 {
+    let mut tooltip = if unread_count == 0 {
         if let Some(mpris) = &state.controls.mpris {
             let status_icon = if mpris.is_playing {
                 "Playing"
@@ -275,6 +280,9 @@ fn run_waybar_status(state_path: Option<&Path>) {
         }
         lines.join("\n")
     };
+    if snoozed_count > 0 {
+        tooltip = format!("{tooltip}\n󰒲 {snoozed_count} snoozed (wake from the drawer)");
+    }
 
     let json = serde_json::json!({
         "text": text,

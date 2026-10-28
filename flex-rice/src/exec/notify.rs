@@ -137,6 +137,15 @@ impl NotificationItem {
         Sender::classify(&self.app_name, self.app_icon.as_deref())
     }
 
+    /// Whether a live snooze is keeping this notification out of the feed.
+    ///
+    /// The flag alone is not enough: once its deadline passes the entry is
+    /// awake again, even though the stale flag is only cleared on load.
+    #[must_use]
+    pub fn is_snoozed_at(&self, now: u64) -> bool {
+        self.is_snoozed && self.snooze_until.is_none_or(|until| now < until)
+    }
+
     /// Whether this notification belongs in the active feed at `now`.
     ///
     /// The single predicate behind the feed rows, the Clear All counter and
@@ -144,13 +153,19 @@ impl NotificationItem {
     /// elapses, and an elapsed sender timeout hides it for good.
     #[must_use]
     pub fn is_active(&self, now: u64) -> bool {
-        if self.is_dismissed {
-            return false;
-        }
-        if self.is_snoozed && self.snooze_until.is_none_or(|until| now < until) {
-            return false;
-        }
-        self.expires_at.is_none_or(|at| now < at)
+        !self.is_dismissed && !self.is_snoozed_at(now) && self.expires_at.is_none_or(|at| now < at)
+    }
+
+    /// Hide this notification from the feed until `minutes` from `now`.
+    pub fn snooze(&mut self, minutes: u32, now: u64) {
+        self.is_snoozed = true;
+        self.snooze_until = Some(now + u64::from(minutes) * 60);
+    }
+
+    /// Wake a snoozed notification immediately.
+    pub fn unsnooze(&mut self) {
+        self.is_snoozed = false;
+        self.snooze_until = None;
     }
 
     /// Whether this notification belongs in the archive: dismissed by the
@@ -1418,6 +1433,13 @@ impl NotifyState {
                 .or(item.expires_at)
                 .is_none_or(|archived_at| now.saturating_sub(archived_at) <= ARCHIVE_RETENTION_SECS)
         });
+        // An elapsed snooze is awake again; drop the stale flag so the row is
+        // not shown under "Snoozed" with a deadline in the past.
+        for item in &mut self.notifications {
+            if item.is_snoozed && !item.is_snoozed_at(now) {
+                item.unsnooze();
+            }
+        }
     }
 }
 
@@ -1507,6 +1529,65 @@ pub fn format_duration(seconds: u64) -> String {
     let secs = seconds % 60;
     format!("{mins:02}:{secs:02}")
 }
+
+/// Render a `body-markup` body as the plain text the drawer and toast show.
+///
+/// The freedesktop capability promises HTML-like markup (`<b>`, `<i>`, `<u>`,
+/// `<a href>`, `<img>`), but flex renders text only, so tags are dropped and
+/// entities are resolved. Callers must only use this when the sender set the
+/// `body-markup` hint: a plain-text body may legitimately contain `<3`.
+#[must_use]
+pub fn plain_text_from_markup(input: &str) -> String {
+    let mut text = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+    unescape_entities(&text)
+}
+
+/// Resolve the XML entities a markup body can carry; unknown entities are kept
+/// verbatim rather than guessed at.
+#[must_use]
+pub fn unescape_entities(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        let Some(end) = after.find(';') else {
+            out.push_str(after);
+            return out;
+        };
+        let entity = &after[1..end];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "nbsp" => Some(' '),
+            _ => entity
+                .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"))
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                .or_else(|| entity.strip_prefix('#').and_then(|dec| dec.parse().ok()))
+                .and_then(char::from_u32),
+        };
+        match decoded {
+            Some(ch) => out.push(ch),
+            None => out.push_str(&after[..=end]),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
 /// Parse urgency from a D-Bus variant hint.
 #[must_use]
 pub fn parse_hint_urgency(val: &zbus::zvariant::Value) -> Urgency {
@@ -1564,6 +1645,56 @@ pub fn play_notification_sound_with_path(
     dnd_active: bool,
     path_override: Option<&str>,
 ) {
+    play_notification_sound_with(urgency, dnd_active, None, path_override);
+}
+
+/// Sound-theme roots searched for a sender's `sound-name` hint.
+const SOUND_THEME_DIRS: [&str; 2] = [
+    "/usr/share/sounds/freedesktop/stereo",
+    "/usr/share/sounds/Yaru/stereo",
+];
+
+/// Resolve a freedesktop sound-theme name (`message-new-instant`, …) to a
+/// playable file.
+///
+/// Only bare theme names are accepted: the hint is sender-controlled, so a
+/// path or `..` segment must never escape the theme directories.
+#[must_use]
+fn themed_sound_path(name: &str) -> Option<PathBuf> {
+    if name.is_empty()
+        || name.contains("..")
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return None;
+    }
+    let dirs: Vec<PathBuf> = SOUND_THEME_DIRS.iter().map(PathBuf::from).collect();
+    themed_sound_path_in(name, &dirs)
+}
+
+/// [`themed_sound_path`] against explicit roots (test seam for fixture dirs).
+fn themed_sound_path_in(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    for dir in dirs {
+        for ext in ["oga", "ogg", "wav"] {
+            let candidate = dir.join(format!("{name}.{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// [`play_notification_sound_with_path`] that honors the sender's
+/// `sound-name` hint, falling back to the urgency default when the theme has
+/// no such sound installed.
+pub fn play_notification_sound_with(
+    urgency: Urgency,
+    dnd_active: bool,
+    sound_name: Option<&str>,
+    path_override: Option<&str>,
+) {
     if dnd_active {
         return;
     }
@@ -1581,17 +1712,24 @@ pub fn play_notification_sound_with_path(
         ],
     };
 
-    let target_file = sound_paths.iter().find(|p| Path::new(p).exists());
-    let Some(&chosen_sound) = target_file else {
+    let chosen_sound = sound_name.and_then(themed_sound_path).or_else(|| {
+        sound_paths
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .map(|p| PathBuf::from(*p))
+    });
+    let Some(chosen_sound) = chosen_sound else {
         return;
     };
+    let chosen = chosen_sound.to_string_lossy();
+    let chosen: &str = chosen.as_ref();
 
     // Try players in order of preference: pw-play, paplay, canberra-gtk-play, aplay
     let players: &[(&str, &[&str])] = &[
-        ("pw-play", &[chosen_sound]),
-        ("paplay", &[chosen_sound]),
-        ("canberra-gtk-play", &["-f", chosen_sound]),
-        ("aplay", &[chosen_sound]),
+        ("pw-play", &[chosen]),
+        ("paplay", &[chosen]),
+        ("canberra-gtk-play", &["-f", chosen]),
+        ("aplay", &[chosen]),
     ];
 
     for &(prog, args) in players {
@@ -1613,6 +1751,46 @@ pub fn play_notification_sound_with_path(
             break;
         }
     }
+}
+
+/// Validate and apply a D-Bus action click.
+///
+/// Returns `true` when `key` belonged to the notification (`"default"` is the
+/// body click). The entry is then archived like a user dismissal: the spec
+/// leaves the sender responsible for re-posting a progress notification.
+#[must_use]
+pub fn complete_action(state: &mut NotifyState, id: u32, key: &str, now: u64) -> bool {
+    let Some(item) = state.notifications.iter_mut().find(|n| n.id == id) else {
+        return false;
+    };
+    if key != "default" && !item.actions.iter().any(|action| action.id == key) {
+        return false;
+    }
+    item.archive(now);
+    true
+}
+
+/// Deliver an action click to the running notification daemon.
+///
+/// `ActionInvoked` must come from the connection that owns
+/// `org.freedesktop.Notifications` — clients filter the signal by sender — so
+/// the drawer cannot emit it from its own connection. It calls the flex
+/// extension `InvokeAction` instead, and the daemon archives the entry and
+/// emits both signals.
+#[must_use]
+pub fn invoke_dbus_action(id: u32, action: &str) -> bool {
+    let Ok(connection) = zbus::blocking::Connection::session() else {
+        return false;
+    };
+    connection
+        .call_method(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            Some("org.freedesktop.Notifications"),
+            "InvokeAction",
+            &(id, action),
+        )
+        .is_ok()
 }
 
 /// D-Bus Notification Service implementation of `org.freedesktop.Notifications`.
@@ -1708,6 +1886,18 @@ impl NotificationServer {
         let urgency = hints
             .get("urgency")
             .map_or(Urgency::Normal, parse_hint_urgency);
+        // `body-markup` promises HTML-like tags; the drawer renders text only,
+        // so resolve the markup once at ingest and both the store and the
+        // toast see the same plain string. Without the hint a body may legally
+        // contain `<3` or `&`, so it is left untouched.
+        let body = if matches!(
+            hints.get("body-markup"),
+            Some(zbus::zvariant::Value::Bool(true))
+        ) {
+            plain_text_from_markup(&body)
+        } else {
+            body
+        };
         let progress = hints
             .get("value")
             .or_else(|| hints.get("progress"))
@@ -1843,9 +2033,13 @@ impl NotificationServer {
                 _ => None,
             })
             .unwrap_or(false);
+        let sound_name = hints.get("sound-name").and_then(|v| match v {
+            zbus::zvariant::Value::Str(s) if !s.is_empty() => Some(s.to_string()),
+            _ => None,
+        });
 
         if !is_dnd && !is_app_muted && !suppress_sound {
-            play_notification_sound(urgency, false);
+            play_notification_sound_with(urgency, false, sound_name.as_deref(), None);
             spawn_toast_with_path(
                 target_id,
                 self.state_path.as_deref(),
@@ -1854,6 +2048,37 @@ impl NotificationServer {
         }
 
         target_id
+    }
+
+    /// Flex extension to the freedesktop interface: the drawer reports a
+    /// clicked action button here, so the daemon (the name owner) emits
+    /// `ActionInvoked` and retires the entry with reason 2 like any other user
+    /// dismissal. Unknown ids and keys are rejected, which lets the drawer fall
+    /// back to a local acknowledgement when the daemon is not the one holding
+    /// this state.
+    ///
+    /// # Errors
+    /// Returns `InvalidArgs` when `id` is unknown or the sender never offered
+    /// `action`, so the caller can fall back to its own acknowledgement.
+    pub async fn invoke_action(
+        &self,
+        id: u32,
+        action: String,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        let mut state = load_state(self.state_path.as_deref());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if !complete_action(&mut state, id, &action, now) {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "notification {id} has no action {action}"
+            )));
+        }
+        let _ = save_state(&state, self.state_path.as_deref());
+        let _ = Self::action_invoked(&emitter, id, &action).await;
+        let _ = Self::notification_closed(&emitter, id, 2).await;
+        Ok(())
     }
 
     /// Emitted when a notification is closed.
@@ -2391,6 +2616,148 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&stubs);
+    }
+
+    #[test]
+    fn body_markup_hint_is_resolved_but_plain_bodies_are_untouched() {
+        let dir = std::env::temp_dir().join(format!("flex-notify-markup-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("markup-state.json");
+        let (stubs, _log) = toast_dir("srv-markup-stubs");
+        let srv = NotificationServer::with_toast_path(Some(path.clone()), stubs.to_string_lossy());
+
+        let mut markup = std::collections::HashMap::new();
+        markup.insert("body-markup".to_string(), zbus::zvariant::Value::Bool(true));
+        srv.notify(
+            "Firefox".to_string(),
+            0,
+            String::new(),
+            "Release".to_string(),
+            "<b>Bold</b> &amp; <a href=\"https://example.com\">link</a>".to_string(),
+            vec![],
+            markup,
+            -1,
+        );
+        srv.notify(
+            "Firefox".to_string(),
+            0,
+            String::new(),
+            "Literal".to_string(),
+            "5 < 6 & 7".to_string(),
+            vec![],
+            std::collections::HashMap::new(),
+            -1,
+        );
+
+        let state = load_state(Some(&path));
+        assert_eq!(
+            state.notifications[0].body, "Bold & link",
+            "tags are dropped and entities resolved"
+        );
+        assert_eq!(
+            state.notifications[1].body, "5 < 6 & 7",
+            "without the hint, a body is plain text"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&stubs);
+    }
+
+    #[test]
+    fn action_clicks_archive_known_keys_only() {
+        let mut item = NotificationItem::new(1, "Firefox", "Done", "", Urgency::Normal);
+        item.timestamp = 100;
+        item.actions = vec![NotificationAction {
+            id: "open".to_string(),
+            title: "Open".to_string(),
+        }];
+        let mut state = NotifyState {
+            notifications: vec![item],
+            ..NotifyState::default()
+        };
+
+        assert!(!complete_action(&mut state, 9, "open", 500), "unknown id");
+        assert!(
+            !complete_action(&mut state, 1, "delete", 500),
+            "a key the sender never offered"
+        );
+        assert!(!state.notifications[0].is_dismissed);
+
+        assert!(complete_action(&mut state, 1, "open", 500));
+        assert!(state.notifications[0].is_dismissed);
+        assert_eq!(state.notifications[0].archived_at, Some(500));
+
+        // `default` is the body click and needs no registered button.
+        let mut plain = NotifyState {
+            notifications: vec![NotificationItem::new(2, "A", "B", "", Urgency::Normal)],
+            ..NotifyState::default()
+        };
+        assert!(complete_action(&mut plain, 2, "default", 700));
+    }
+
+    #[test]
+    fn snooze_hides_a_notification_until_its_deadline() {
+        let mut item = NotificationItem::new(1, "Slack", "standup", "", Urgency::Normal);
+        item.timestamp = 100;
+        item.snooze(15, 1_000);
+
+        assert!(item.is_snoozed_at(1_000));
+        assert!(!item.is_active(1_000), "a live snooze leaves the feed");
+        assert!(!item.is_snoozed_at(1_900), "the deadline wakes it");
+        assert!(item.is_active(1_900));
+
+        item.unsnooze();
+        assert!(!item.is_snoozed_at(1_000));
+        assert!(item.is_active(1_000), "waking restores the feed row");
+    }
+
+    #[test]
+    fn stale_snooze_flags_are_cleared_on_load() {
+        let dir = std::env::temp_dir().join(format!("flex-notify-unsnooze-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("snooze-state.json");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
+        let mut item = NotificationItem::new(1, "Slack", "old", "", Urgency::Normal);
+        item.timestamp = now;
+        item.is_snoozed = true;
+        item.snooze_until = Some(now.saturating_sub(1));
+        let state = NotifyState {
+            notifications: vec![item],
+            ..NotifyState::default()
+        };
+        save_state(&state, Some(&path)).expect("saved");
+
+        let loaded = load_state(Some(&path));
+        assert!(!loaded.notifications[0].is_snoozed, "the flag is stale");
+        assert!(loaded.notifications[0].is_active(now));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn themed_sound_names_stay_inside_the_theme_dirs() {
+        let dir = std::env::temp_dir().join(format!("flex-notify-sound-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        assert_eq!(
+            themed_sound_path_in("bell", std::slice::from_ref(&dir)),
+            None
+        );
+
+        std::fs::write(dir.join("bell.oga"), b"fixture").expect("fixture writes");
+        assert_eq!(
+            themed_sound_path_in("bell", std::slice::from_ref(&dir)),
+            Some(dir.join("bell.oga"))
+        );
+
+        // The hint is sender-controlled: never let it escape the theme dir.
+        assert_eq!(themed_sound_path("../etc/passwd"), None);
+        assert_eq!(themed_sound_path("bad/name"), None);
+        assert_eq!(themed_sound_path(""), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

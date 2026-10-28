@@ -147,6 +147,8 @@ pub enum NotifyAction {
         notification: u32,
         minutes: u32,
     },
+    /// Wake a snoozed notification now.
+    Unsnooze(u32),
     Restore(u32),
     /// Permanently drop one notification (History's Delete key).
     Purge(u32),
@@ -210,6 +212,7 @@ impl NotifyAction {
                 notification,
                 minutes,
             } => format!("snooze:{minutes}:{notification}"),
+            Self::Unsnooze(id) => format!("unsnooze:{id}"),
             Self::Restore(id) => format!("restore:{id}"),
             Self::Purge(id) => format!("purge:{id}"),
             Self::ClearAll => String::from("clear_all"),
@@ -287,6 +290,7 @@ impl NotifyAction {
                 }
             }
             "restore" => Self::Restore(payload.parse().ok()?),
+            "unsnooze" => Self::Unsnooze(payload.parse().ok()?),
             "purge" => Self::Purge(payload.parse().ok()?),
             "clear_all" => Self::ClearAll,
             "clear_history" => Self::ClearHistory,
@@ -313,8 +317,9 @@ impl NotifyAction {
     ///
     /// Row identity and action ids differ: a notification row is
     /// `notif:<id>` but Delete dismisses it, a thread row is `group:<app>` but
-    /// Delete dismisses that app, a history row (`hist:<id>`) is purged for
-    /// good, and the Quick Controls card clears everything clearable.
+    /// Delete dismisses that app, a snoozed row (`unsnooze:<id>`) is dismissed
+    /// rather than woken, a history row (`hist:<id>`) is purged for good, and
+    /// the Quick Controls card clears everything clearable.
     #[must_use]
     pub fn for_delete(row_id: &str) -> Option<Self> {
         if row_id == ACTION_QUICK_CONTROLS {
@@ -324,7 +329,7 @@ impl NotifyAction {
             return id.parse().ok().map(Self::Purge);
         }
         match Self::parse(row_id)? {
-            Self::OpenNotification(id) => Some(Self::Dismiss(id)),
+            Self::OpenNotification(id) | Self::Unsnooze(id) => Some(Self::Dismiss(id)),
             Self::ToggleThread(app) => Some(Self::DismissApp(app)),
             _ => None,
         }
@@ -480,6 +485,11 @@ fn push_content_targets(
     }
 
     for action in &item.actions {
+        // `default` is the spec's body click, which Enter already performs;
+        // listing it as a button would duplicate the row's own affordance.
+        if action.id == "default" {
+            continue;
+        }
         targets.push(
             NotifyAction::DbusAction {
                 notification: item.id,
@@ -720,6 +730,37 @@ fn child_notification_row_from(
     row
 }
 
+/// Rows for notifications hidden by a live snooze.
+///
+/// A snooze is a reminder, not a deletion: without these rows the entry
+/// disappears from both tabs until its deadline, with no way to wake it early.
+/// Enter on the row wakes it (the row id is the `Unsnooze` action), and the
+/// meta carries the remaining time.
+fn push_snoozed_rows(rows: &mut Vec<Row>, state: &NotifyState, now: u64) {
+    let mut snoozed: Vec<&NotificationItem> = state
+        .notifications
+        .iter()
+        .filter(|n| !n.is_dismissed && n.is_snoozed_at(now))
+        .collect();
+    snoozed.sort_by_key(|n| n.snooze_until.unwrap_or(u64::MAX));
+
+    for item in snoozed {
+        let remaining = item
+            .snooze_until
+            .map_or(0, |until| until.saturating_sub(now));
+        let mut row = notification_row_from(item, state, now);
+        row.id = NotifyAction::Unsnooze(item.id).encode();
+        row.label = format!("󰒲 {}", item.app_name);
+        row.meta = Some(format!("Snoozed · {}m left", remaining.div_ceil(60)));
+        // Re-snoozing a sleeping row makes no sense; waking it does.
+        row.targets
+            .retain(|t| !t.id.as_str().starts_with("snooze:"));
+        row.targets
+            .insert(0, NotifyAction::Unsnooze(item.id).target("Wake Now"));
+        rows.push(row);
+    }
+}
+
 /// Construct the `[Feed]` tab.
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -895,6 +936,8 @@ pub fn feed_tab_from(state: &NotifyState, now: u64) -> Tab {
             rows.push(notification_row_from(item, state, now));
         }
     }
+
+    push_snoozed_rows(&mut rows, state, now);
 
     if rows.is_empty() {
         rows.push(Row::new(
@@ -1073,10 +1116,21 @@ pub fn execute(
     if let Some(action) = parsed {
         match action {
             NotifyAction::OpenNotification(id) => {
-                if let Some(n) = state.notifications.iter().find(|n| n.id == id) {
+                // Enter on a notification is the spec's body click: a sender
+                // that registered a `default` action expects to hear about it,
+                // and opening its app instead would silently drop the intent.
+                let has_default = state
+                    .notifications
+                    .iter()
+                    .find(|n| n.id == id)
+                    .is_some_and(|n| n.actions.iter().any(|a| a.id == "default"));
+                if has_default && notify::invoke_dbus_action(id, "default") {
+                    // The daemon archived the entry; our snapshot is stale.
+                    state = notify::load_state(state_path);
+                } else if let Some(n) = state.notifications.iter().find(|n| n.id == id) {
                     notify::open_application_with(&n.app_name, n.app_icon.as_deref());
-                    should_close = true;
                 }
+                should_close = true;
             }
             NotifyAction::OpenApp { name, icon } => {
                 notify::open_application_with(&name, icon.as_deref());
@@ -1151,14 +1205,25 @@ pub fn execute(
                     .iter_mut()
                     .find(|n| n.id == notification)
                 {
-                    n.is_snoozed = true;
-                    n.snooze_until = Some(now + u64::from(minutes) * 60);
+                    n.snooze(minutes, now);
                 }
             }
-            NotifyAction::DbusAction { notification, .. } => {
-                // No D-Bus client here: acknowledging the button dismisses the
-                // notification and closes the drawer.
-                if let Some(n) = state
+            NotifyAction::Unsnooze(id) => {
+                if let Some(n) = state.notifications.iter_mut().find(|n| n.id == id) {
+                    n.unsnooze();
+                }
+            }
+            NotifyAction::DbusAction {
+                notification,
+                action,
+            } => {
+                // The signal has to come from the daemon (the name owner), so
+                // deliver the click there. Without a daemon — or if it rejects
+                // a stale button — acknowledge locally so the drawer still
+                // closes instead of lying about a live action.
+                if notify::invoke_dbus_action(notification, &action) {
+                    state = notify::load_state(state_path);
+                } else if let Some(n) = state
                     .notifications
                     .iter_mut()
                     .find(|n| n.id == notification)
@@ -1531,6 +1596,7 @@ mod tests {
                 minutes: 15,
             },
             NotifyAction::Restore(11),
+            NotifyAction::Unsnooze(13),
             NotifyAction::Purge(12),
             NotifyAction::ClearAll,
             NotifyAction::ClearHistory,
@@ -1642,6 +1708,11 @@ mod tests {
             "history rows are purged, not re-dismissed"
         );
         assert_eq!(
+            NotifyAction::for_delete("unsnooze:5"),
+            Some(NotifyAction::Dismiss(5)),
+            "Delete on a sleeping row dismisses it, it does not wake it"
+        );
+        assert_eq!(
             NotifyAction::for_delete(ACTION_QUICK_CONTROLS),
             Some(NotifyAction::ClearAll)
         );
@@ -1716,6 +1787,70 @@ mod tests {
             .find(|t| t.id.as_str() == "clear_history")
             .expect("archived rows offer Clear History");
         assert_eq!(target.title, "Clear History (1)");
+    }
+
+    #[test]
+    fn snoozed_rows_stay_visible_with_their_remaining_time() {
+        let mut sleeping = NotificationItem::new(1, "Slack", "standup in 10", "", Urgency::Normal);
+        sleeping.timestamp = 100;
+        sleeping.snooze(15, 1_000);
+        let mut awake = NotificationItem::new(2, "Discord", "ping", "", Urgency::Normal);
+        awake.timestamp = 100;
+
+        let state = NotifyState {
+            notifications: vec![sleeping, awake],
+            ..NotifyState::default()
+        };
+        let tab = feed_tab_from(&state, 1_000);
+
+        assert_eq!(tab.rows[0].id.as_str(), ACTION_QUICK_CONTROLS);
+        assert_eq!(
+            tab.rows[1].id.as_str(),
+            "notif:2",
+            "a live snooze leaves the active stream"
+        );
+        let snoozed = &tab.rows[2];
+        assert_eq!(snoozed.id.as_str(), "unsnooze:1");
+        assert_eq!(snoozed.meta.as_deref(), Some("Snoozed · 15m left"));
+        assert!(snoozed.targets.iter().any(|t| t.title == "Wake Now"));
+        assert!(
+            !snoozed
+                .targets
+                .iter()
+                .any(|t| t.id.as_str().starts_with("snooze:")),
+            "a sleeping row offers no second snooze"
+        );
+    }
+
+    #[test]
+    fn the_default_action_is_the_body_click_not_a_button() {
+        let mut item = NotificationItem::new(1, "Firefox", "Done", "", Urgency::Normal);
+        item.actions = vec![
+            notify::NotificationAction {
+                id: "default".to_string(),
+                title: "Open".to_string(),
+            },
+            notify::NotificationAction {
+                id: "reply".to_string(),
+                title: "Reply".to_string(),
+            },
+        ];
+        let state = NotifyState {
+            notifications: vec![item],
+            ..NotifyState::default()
+        };
+        let tab = feed_tab_from(&state, 100);
+        let row = &tab.rows[1];
+        assert!(row
+            .targets
+            .iter()
+            .any(|t| t.id.as_str() == "action:1:reply"));
+        assert!(
+            !row.targets
+                .iter()
+                .any(|t| t.id.as_str() == "action:1:default"),
+            "Enter already performs the default action"
+        );
     }
 
     #[test]
