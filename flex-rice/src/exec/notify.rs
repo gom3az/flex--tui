@@ -2415,7 +2415,11 @@ mod tests {
 
         // No id, no feed entry, no unread badge — just the card on screen.
         assert_eq!(id, 0);
-        assert!(load_state(Some(&path)).notifications.is_empty());
+        assert_eq!(
+            load_state(Some(&path)).notifications.first(),
+            None,
+            "the failed open must not add a feed entry"
+        );
         let logged = read_log_soon(&kitty_log);
         assert!(
             logged.contains("File not found") && logged.contains("/tmp/gone.png"),
@@ -2605,7 +2609,7 @@ mod tests {
             !loaded.notifications.iter().any(|n| n.id == 1),
             "archived entries past retention are dropped"
         );
-        assert!(loaded.muted_apps.is_empty(), "expired rules are pruned");
+        assert_eq!(loaded.muted_apps.first(), None, "expired rules are pruned");
         assert_eq!(loaded.priority_apps.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
