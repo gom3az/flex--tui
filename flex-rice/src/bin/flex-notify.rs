@@ -44,6 +44,10 @@ struct Cli {
     #[arg(long = "clear-all")]
     clear_all: bool,
 
+    /// Permanently clear dismissed/expired notification history
+    #[arg(long = "clear-history")]
+    clear_history: bool,
+
     /// Toggle Do Not Disturb mode
     #[arg(long = "toggle-dnd")]
     toggle_dnd: bool,
@@ -111,6 +115,13 @@ enum NotifyOp {
         /// Notification ID to render
         id: u32,
     },
+    /// Render a transient toast for ad-hoc text (nothing is stored)
+    ToastText {
+        /// Card summary line
+        summary: String,
+        /// Card body line
+        body: String,
+    },
 }
 
 fn now_secs() -> u64 {
@@ -128,18 +139,28 @@ fn now_secs() -> u64 {
 /// instance stays tiny. Hyprland positions it via the `flex-notify-toast`
 /// window rule.
 fn run_toast(id: u32, state_path: Option<&std::path::Path>) {
-    use std::io::Write as _;
-
     let state = notify::load_state(state_path);
-    let now = now_secs();
-
-    let item = state.notifications.iter().find(|n| n.id == id);
-    let Some(item) = item else {
+    let Some(item) = state.notifications.iter().find(|n| n.id == id) else {
         return;
     };
+    render_toast(item);
+}
 
-    let is_critical = item.urgency == Urgency::Critical;
-    let timeout_secs: u64 = if is_critical { 7 } else { 4 };
+/// Render a toast for text that is not in the store (`flex-notify toast-text`).
+///
+/// Used for flex's own feedback (e.g. "File not found"): it must be visible
+/// without becoming a feed entry, so it is rendered straight from the argv and
+/// never touches the notification state.
+fn run_toast_text(summary: &str, body: &str) {
+    let item = notify::NotificationItem::new(0, "flex-notify", summary, body, Urgency::Normal);
+    render_toast(&item);
+}
+
+fn render_toast(item: &notify::NotificationItem) {
+    use std::io::Write as _;
+
+    let now = now_secs();
+    let timeout_secs = notify::toast_timeout_secs(item, now);
 
     let rel = notify::format_relative_time(item.timestamp, now);
 
@@ -172,9 +193,7 @@ fn run_waybar_status(state_path: Option<&Path>) {
     let active: Vec<_> = state
         .notifications
         .iter()
-        .filter(|n| {
-            !n.is_dismissed && (!n.is_snoozed || n.snooze_until.is_some_and(|until| now >= until))
-        })
+        .filter(|n| n.is_active(now))
         .collect();
 
     let unread_count = active.len();
@@ -296,9 +315,10 @@ fn handle_op(op: NotifyOp, state_path: Option<&Path>) -> anyhow::Result<()> {
         }
         NotifyOp::ClearAll => {
             let mut state = notify::load_state(state_path);
+            let now = now_secs();
             for n in &mut state.notifications {
                 if !n.is_pinned && n.urgency != Urgency::Critical {
-                    n.is_dismissed = true;
+                    n.archive(now);
                 }
             }
             notify::save_state(&state, state_path)?;
@@ -321,6 +341,10 @@ fn handle_op(op: NotifyOp, state_path: Option<&Path>) -> anyhow::Result<()> {
             run_toast(id, state_path);
             Ok(())
         }
+        NotifyOp::ToastText { summary, body } => {
+            run_toast_text(&summary, &body);
+            Ok(())
+        }
     }
 }
 
@@ -340,13 +364,22 @@ async fn run() -> anyhow::Result<()> {
 
     if cli.clear_all {
         let mut state = notify::load_state(state_path);
+        let now = now_secs();
         for n in &mut state.notifications {
             if !n.is_pinned && n.urgency != Urgency::Critical {
-                n.is_dismissed = true;
+                n.archive(now);
             }
         }
         notify::save_state(&state, state_path)?;
         println!("Cleared active notifications");
+        return Ok(());
+    }
+
+    if cli.clear_history {
+        let mut state = notify::load_state(state_path);
+        state.clear_history(now_secs());
+        notify::save_state(&state, state_path)?;
+        println!("Cleared notification history");
         return Ok(());
     }
 
@@ -393,19 +426,12 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
                 Outcome::Delete { action_id, .. } => {
-                    let action = if action_id.starts_with("notif:") {
-                        format!("dismiss:{}", action_id.trim_start_matches("notif:"))
-                    } else if action_id == provider::ACTION_QUICK_CONTROLS
-                        || action_id == "quick:controls"
-                        || action_id == "quick_controls"
-                        || action_id == "clear_all"
-                        || action_id == provider::ACTION_CLEAR_ALL
-                    {
-                        provider::ACTION_CLEAR_ALL.to_string()
-                    } else {
-                        format!("dismiss:{action_id}")
-                    };
-                    let _ = provider::execute(&action, "Dismiss", state_path);
+                    // The Delete key maps a row id back to its destructive
+                    // action: dismiss a notification, dismiss an app thread,
+                    // purge a history row, or clear the whole feed.
+                    if let Some(action) = provider::NotifyAction::for_delete(&action_id) {
+                        let _ = provider::execute(action.encode().as_str(), "Delete", state_path);
+                    }
                 }
                 Outcome::Quit { code } => {
                     std::process::exit(code);

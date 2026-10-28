@@ -329,7 +329,12 @@ fn executor_dismiss_and_dnd_dispatch() {
     );
 
     // Clear all (non-critical)
-    let _ = provider::execute(provider::ACTION_CLEAR_ALL, "Clear All", Some(&path)).expect("exec");
+    let _ = provider::execute(
+        provider::NotifyAction::ClearAll.encode().as_str(),
+        "Clear All",
+        Some(&path),
+    )
+    .expect("exec");
     let s2 = notify::load_state(Some(&path));
     assert!(
         s2.notifications
@@ -347,19 +352,29 @@ fn executor_dismiss_and_dnd_dispatch() {
             .is_dismissed
     );
 
-    // Clear all via quick controls action
-    let _ = provider::execute("dismiss:quick:controls", "Dismiss", Some(&path)).expect("exec");
+    // The Quick Controls *row* has no action of its own: Enter on it opens
+    // the shelf, it does not clear anything. Only the shelf's Clear All
+    // target does.
+    let _ =
+        provider::execute(provider::ACTION_QUICK_CONTROLS, "Dismiss", Some(&path)).expect("exec");
     let s3 = notify::load_state(Some(&path));
     assert!(
-        s3.notifications
+        !s3.notifications
             .iter()
-            .find(|n| n.id == 2)
+            .find(|n| n.id == 1)
             .unwrap()
-            .is_dismissed
+            .is_dismissed,
+        "the Quick Controls row must not clear the critical alert"
     );
 
-    // Group dismiss
-    let _ = provider::execute("dismiss:group:Discord", "Dismiss", Some(&path)).expect("exec");
+    // Group dismiss (the delete path maps a thread row to this action)
+    notify::save_state(&state, Some(&path)).expect("saved again");
+    let group = provider::NotifyAction::parse("group:Discord").expect("group row parses");
+    assert_eq!(
+        group,
+        provider::NotifyAction::ToggleThread("Discord".to_string())
+    );
+    let _ = provider::execute("dismiss_app:Discord", "Dismiss", Some(&path)).expect("exec");
     let s4 = notify::load_state(Some(&path));
     assert!(
         s4.notifications
@@ -379,6 +394,57 @@ fn executor_dismiss_and_dnd_dispatch() {
             ..
         }
     ));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn executor_app_rules_and_archive_disposal() {
+    let dir = std::env::temp_dir().join(format!("flex-notify-test-rules-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("state.json");
+
+    notify::save_state(&mock_state(), Some(&path)).expect("saved");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+
+    // "Silence for 1 Hour" is a real, expiring rule.
+    provider::execute("mute_app:Discord", "Silence", Some(&path)).expect("exec");
+    let muted = notify::load_state(Some(&path));
+    assert!(muted.is_muted("Discord", now));
+    assert!(muted.is_muted("discord", now + 3_500));
+    assert!(!muted.is_muted("Discord", now + 3_700));
+
+    provider::execute("unmute_app:Discord", "Unmute", Some(&path)).expect("exec");
+    assert!(
+        !notify::load_state(Some(&path)).is_muted("Discord", now),
+        "Unmute removes the rule before its hour is up"
+    );
+
+    // Priority toggles both ways.
+    provider::execute("priority_app:Discord", "Priority", Some(&path)).expect("exec");
+    assert!(notify::load_state(Some(&path)).is_priority("discord", now));
+    provider::execute("priority_app:Discord", "Priority", Some(&path)).expect("exec");
+    assert!(!notify::load_state(Some(&path)).is_priority("Discord", now));
+
+    // Purge removes one archived row without touching the rest.
+    provider::execute("purge:3", "Delete", Some(&path)).expect("exec");
+    let purged = notify::load_state(Some(&path));
+    assert!(!purged.notifications.iter().any(|n| n.id == 3));
+    assert!(purged.notifications.iter().any(|n| n.id == 2));
+
+    // Clear History removes archived rows only.
+    provider::execute("clear_history", "Clear History", Some(&path)).expect("exec");
+    let cleared = notify::load_state(Some(&path));
+    assert!(
+        !cleared.notifications.iter().any(|n| n.id == 4),
+        "dismissed rows are purged"
+    );
+    assert!(
+        cleared.notifications.iter().any(|n| n.id == 1),
+        "active and critical rows survive"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

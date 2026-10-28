@@ -7,11 +7,15 @@
 //! - MPRIS track info and playback commands
 //! - Persistent runtime store at `$XDG_RUNTIME_DIR/flex-notify.json`
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use crate::providers::launch;
 
 /// Urgency level matching the `FreeDesktop` notification specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +68,16 @@ pub struct NotificationItem {
     pub is_pinned: bool,
     pub is_snoozed: bool,
     pub snooze_until: Option<u64>,
+    /// Absolute end of the sender's requested lifetime (`expire_timeout`).
+    ///
+    /// `None` means "keep until dismissed", flex's server default; critical
+    /// alerts never expire.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    /// When the notification was dismissed, used only by archive retention.
+    /// Entries archived before this field existed leave it unset.
+    #[serde(default)]
+    pub archived_at: Option<u64>,
     pub is_dismissed: bool,
     #[serde(default)]
     pub group: Option<String>,
@@ -96,6 +110,8 @@ impl NotificationItem {
             is_pinned: urgency == Urgency::Critical,
             is_snoozed: false,
             snooze_until: None,
+            expires_at: None,
+            archived_at: None,
             is_dismissed: false,
             group: None,
         }
@@ -113,6 +129,54 @@ impl NotificationItem {
     pub fn with_image(mut self, image_path: impl Into<String>) -> Self {
         self.image_path = Some(image_path.into());
         self
+    }
+
+    /// Classify this notification's sender label (see [`Sender`]).
+    #[must_use]
+    pub fn sender(&self) -> Sender {
+        Sender::classify(&self.app_name, self.app_icon.as_deref())
+    }
+
+    /// Whether this notification belongs in the active feed at `now`.
+    ///
+    /// The single predicate behind the feed rows, the Clear All counter and
+    /// the Waybar badge: a snooze hides the notification only until it
+    /// elapses, and an elapsed sender timeout hides it for good.
+    #[must_use]
+    pub fn is_active(&self, now: u64) -> bool {
+        if self.is_dismissed {
+            return false;
+        }
+        if self.is_snoozed && self.snooze_until.is_none_or(|until| now < until) {
+            return false;
+        }
+        self.expires_at.is_none_or(|at| now < at)
+    }
+
+    /// Whether this notification belongs in the archive: dismissed by the
+    /// user, or retired by its sender's timeout.
+    #[must_use]
+    pub fn is_archived(&self, now: u64) -> bool {
+        self.is_dismissed || self.expires_at.is_some_and(|at| now >= at)
+    }
+
+    /// Move this notification into the archive at `now`.
+    ///
+    /// Idempotent: the first dismissal time is what retention measures, so a
+    /// later clear-all cannot extend an old entry's life.
+    pub fn archive(&mut self, now: u64) {
+        if !self.is_dismissed {
+            self.is_dismissed = true;
+            self.archived_at = Some(now);
+        }
+    }
+
+    /// Bring an archived notification back to the feed.
+    pub fn restore(&mut self) {
+        self.is_dismissed = false;
+        self.archived_at = None;
+        // A restored sender-expired notification must actually come back.
+        self.expires_at = None;
     }
 }
 
@@ -285,18 +349,97 @@ pub fn open_url(url: &str) {
     let _ = crate::spawn::spawn_detached(Path::new("setsid"), Path::new("xdg-open"), &[url]);
 }
 
-/// Open a file path using `xdg-open` detached via `setsid -f`.
-pub fn open_file(path_str: &str) {
-    let expanded = if let Some(rest) = path_str.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            format!("{home}/{rest}")
-        } else {
-            path_str.to_string()
+/// A user-facing failure from an Open action.
+///
+/// Returned instead of shown immediately so the caller can finish its own
+/// bookkeeping first and then call [`report_failure`]. See [`report_failure`]
+/// for why the feedback is a transient toast instead of a stored
+/// notification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// Notification summary (`File not found`, …).
+    pub summary: &'static str,
+    /// Notification body (the path, or a short reason).
+    pub detail: String,
+}
+
+impl Failure {
+    /// Build a failure with a `String`-able detail.
+    #[must_use]
+    pub fn new(summary: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            summary,
+            detail: detail.into(),
         }
-    } else {
-        path_str.to_string()
+    }
+}
+
+/// Open a file path using `xdg-open` detached via `setsid -f`.
+///
+/// A path captured from an older notification may be gone by the time the
+/// user taps `Open File`; the detached `xdg-open` would then fail invisibly
+/// (and the drawer exits right after, taking its stderr with it). Returns a
+/// [`Failure`] for the caller to report once its state is saved.
+#[must_use]
+pub fn open_file(path_str: &str) -> Option<Failure> {
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    open_file_with(path_str, &path_env)
+}
+
+/// [`open_file`] with an explicit `PATH` (test seam).
+fn open_file_with(path_str: &str, path_env: &str) -> Option<Failure> {
+    let expanded = expand_home(path_str);
+    if !Path::new(&expanded).exists() {
+        return Some(Failure::new("File not found", expanded));
+    }
+    let (Some(setsid), Some(xdg_open)) = (
+        crate::tools::resolve_tool("setsid", path_env),
+        crate::tools::resolve_tool("xdg-open", path_env),
+    ) else {
+        return Some(Failure::new(
+            "Cannot open file",
+            format!("xdg-open is not installed: {expanded}"),
+        ));
     };
-    let _ = crate::spawn::spawn_detached(Path::new("setsid"), Path::new("xdg-open"), &[&expanded]);
+    if crate::spawn::spawn_detached(&setsid, &xdg_open, &[expanded.as_str()]).is_err() {
+        return Some(Failure::new("Cannot open file", expanded));
+    }
+    None
+}
+
+/// Report a failed action as a transient toast.
+///
+/// Deliberately *not* persisted: this is feedback about something the user
+/// just did, not an incoming event. A stored copy would leave a feed entry
+/// behind and bump the unread badge on every failed attempt. The `transient`
+/// freedesktop hint tells the server to show it and drop it, so the daemon
+/// renders the card straight from the payload.
+///
+/// Best-effort: without `notify-send` (or a running daemon) there is nothing
+/// left to report with, so it stays silent.
+pub fn report_failure(summary: &str, detail: &str) {
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    report_failure_with(summary, detail, &path_env);
+}
+
+/// [`report_failure`] with an explicit `PATH` (test seam).
+fn report_failure_with(summary: &str, detail: &str, path_env: &str) {
+    let Some(bin) = crate::tools::resolve_tool("notify-send", path_env) else {
+        return;
+    };
+    let _ = Command::new(&bin)
+        .args([
+            "-a",
+            "flex-notify",
+            "-h",
+            "boolean:transient:true",
+            summary,
+            detail,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Managers that can highlight a file (`--select <file>`).
@@ -345,41 +488,48 @@ fn reveal_targets(path_str: &str) -> Option<(PathBuf, PathBuf)> {
 /// installed manager, then `xdg-open` as a last resort. The `xdg-open`
 /// fallback is last because a terminal emulator can claim `inode/directory`
 /// (e.g. `kitty-open.desktop`), which would open a terminal instead of the
-/// file manager. Silent no-op when nothing exists to reveal.
-pub fn open_dir(path_str: &str) {
+/// file manager. Failures (nothing to reveal, a vanished folder, no manager)
+/// come back as a [`Failure`] for the caller to report.
+#[must_use]
+pub fn open_dir(path_str: &str) -> Option<Failure> {
     let path_env = std::env::var("PATH").unwrap_or_default();
-    open_dir_with_path(path_str, &path_env);
+    open_dir_with_path(path_str, &path_env)
 }
 
 /// [`open_dir`] with an explicit `PATH` (test seam for manager lookup).
-fn open_dir_with_path(path_str: &str, path_env: &str) {
+fn open_dir_with_path(path_str: &str, path_env: &str) -> Option<Failure> {
     let Some((file, dir)) = reveal_targets(path_str) else {
-        return;
+        let label = path_str.trim();
+        if label.is_empty() {
+            return None;
+        }
+        return Some(Failure::new("Folder not found", label));
     };
+    let dir_str = dir.to_string_lossy().into_owned();
     if !dir.is_dir() {
-        return;
+        return Some(Failure::new("Folder not found", dir_str));
     }
+    let Some(setsid) = crate::tools::resolve_tool("setsid", path_env) else {
+        return Some(Failure::new("Cannot open folder", dir_str));
+    };
     if file.is_file() {
         let file_str = file.to_string_lossy();
         if let Some(mgr) = first_manager(SELECT_MANAGERS, path_env) {
-            let _ = crate::spawn::spawn_detached(
-                Path::new("setsid"),
-                Path::new(mgr),
-                &["--select", &file_str],
-            );
-            return;
+            let _ = crate::spawn::spawn_detached(&setsid, Path::new(mgr), &["--select", &file_str]);
+            return None;
         }
     }
-    let dir_str = dir.to_string_lossy();
     if let Some(mgr) = first_manager(BROWSE_MANAGERS, path_env) {
-        let _ = crate::spawn::spawn_detached(Path::new("setsid"), Path::new(mgr), &[&dir_str]);
-        return;
+        let _ = crate::spawn::spawn_detached(&setsid, Path::new(mgr), &[dir_str.as_str()]);
+        return None;
     }
-    let _ = crate::spawn::spawn_detached(
-        Path::new("setsid"),
-        Path::new("xdg-open"),
-        &[dir_str.as_ref()],
-    );
+    let Some(xdg_open) = crate::tools::resolve_tool("xdg-open", path_env) else {
+        return Some(Failure::new("Cannot open folder", dir_str));
+    };
+    if crate::spawn::spawn_detached(&setsid, &xdg_open, &[dir_str.as_str()]).is_err() {
+        return Some(Failure::new("Cannot open folder", dir_str));
+    }
+    None
 }
 
 /// Expand a leading `~/` against `$HOME` (the same rule as [`open_file`]).
@@ -618,109 +768,354 @@ fn find_matching_client<'a>(
     None
 }
 
+/// Flex-owned sender labels: `app_name`s flex itself emits that stand for
+/// something other than a desktop application.
+///
+/// `clip` posts as `Cliphist` (no `cliphist` binary exists — the state lives in
+/// the flex clip popup) and flex's own feedback posts as `flex-notify`. Both
+/// are recognised before desktop resolution, so a coincidentally named
+/// `.desktop` file can never hijack them.
+fn flex_sender(clean: &str) -> Option<Sender> {
+    match clean {
+        "flex-notify" => Some(Sender::Feedback),
+        "cliphist" => Some(Sender::FlexPopup {
+            class: crate::popup::WIDE_CLASS,
+            provider: &["clip"],
+        }),
+        _ => None,
+    }
+}
+
+/// Open (or toggle) the popup running `flex <provider…>`.
+///
+/// Goes through [`crate::popup::toggle_detached`] so an already-open popup of
+/// the same variant closes instead of stacking, exactly like the keybinds, and
+/// a newly spawned popup lands in its own session: the drawer runs this action
+/// inside its kitty pty and exits right after, so a same-group child would be
+/// killed by the pty hangup before its window appears. `kind` is
+/// [`crate::terminal::detect`] in production and pinned to kitty in tests;
+/// `path_env` is the stub-`PATH` seam.
+fn open_flex_popup(
+    class: &str,
+    provider: &[&str],
+    kind: crate::terminal::TerminalKind,
+    path_env: &str,
+) -> bool {
+    let Some(dispatcher) = flex_dispatcher(path_env) else {
+        log_notify_trace("[FLEX_POPUP] cannot locate the flex dispatcher");
+        return false;
+    };
+    let mut argv = Vec::with_capacity(provider.len() + 1);
+    argv.push(dispatcher.to_string_lossy().into_owned());
+    argv.extend(provider.iter().map(|arg| String::from(*arg)));
+    crate::popup::toggle_detached(kind, class, &argv, Some(path_env)).is_ok()
+}
+
+/// Absolute path to the `flex` dispatcher.
+///
+/// The drawer inherits its launcher's `PATH` — waybar's, which has no
+/// `~/.local/bin` — so a bare `flex` in the popup command dies with "command
+/// not found" and kitty closes the window immediately. Prefer the sibling of
+/// the running binary (the whole farm is installed in one directory, and the
+/// dispatcher resolves its providers the same way), then `PATH`.
+fn flex_dispatcher(path_env: &str) -> Option<PathBuf> {
+    sibling_binary("flex", path_env)
+}
+
+/// Absolute path to an installed farm binary called `name`.
+///
+/// The drawer inherits its launcher's `PATH` — waybar's, which has no
+/// `~/.local/bin` — so bare names fail there. Prefer the sibling of the
+/// running binary (the whole farm is installed in one directory), then `PATH`.
+fn sibling_binary(name: &str, path_env: &str) -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join(name);
+            if sibling.is_file() {
+                return Some(sibling);
+            }
+        }
+    }
+    crate::tools::resolve_tool(name, path_env)
+}
+
+/// What a notification's `app_name` names.
+///
+/// `app_name` is a free-form display label, not an identifier: CLI posts
+/// default to `notify-send`, flex's own providers send `Wi-Fi` / `Cliphist`,
+/// test harnesses send `e2e`, and scripts send their own file names. Actions
+/// that need an application (`Open App`) are therefore derived from what the
+/// label resolves to, never from a list of labels to exclude.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sender {
+    /// An installed desktop application.
+    Application(launch::DesktopEntry),
+    /// A flex-owned label that stands for one of flex's popups.
+    FlexPopup {
+        /// Popup window class — the toggle key, see [`crate::popup`].
+        class: &'static str,
+        /// `flex` provider argv the popup runs.
+        provider: &'static [&'static str],
+    },
+    /// Flex's own feedback channel: the body is the action that just failed.
+    Feedback,
+    /// No application behind the label: nothing to open or launch.
+    Other,
+}
+
+impl Sender {
+    /// Classify `app_name`, using the `app_icon` hint to link display names
+    /// that match no desktop `Name` (KDE's `Crash Reporting System` is only
+    /// connected to its entry by `Icon=tools-report-bug`).
+    #[must_use]
+    pub fn classify(app_name: &str, app_icon: Option<&str>) -> Self {
+        let key = (app_name.trim().to_string(), app_icon.map(str::to_string));
+        if let Ok(cache) = sender_cache().lock() {
+            if let Some(hit) = cache.get(&key) {
+                return hit.clone();
+            }
+        }
+        let sender = Self::classify_in(&launch::app_dirs(), app_name, app_icon);
+        if let Ok(mut cache) = sender_cache().lock() {
+            // The feed rebuilds every tick; entries are bounded by the number
+            // of distinct senders, but stay defensive like the other caches.
+            if cache.len() >= 512 {
+                cache.clear();
+            }
+            cache.insert(key, sender.clone());
+        }
+        sender
+    }
+
+    /// [`classify`](Self::classify) over explicit desktop dirs (tests).
+    ///
+    /// Uncached: the memo is keyed by sender label alone, so fixture
+    /// directories would collide with the real scan.
+    #[must_use]
+    pub fn classify_in(app_dirs: &[PathBuf], app_name: &str, app_icon: Option<&str>) -> Self {
+        let clean = app_name.trim().to_lowercase();
+        if clean.is_empty() {
+            return Self::Other;
+        }
+        if let Some(sender) = flex_sender(&clean) {
+            return sender;
+        }
+        launch::find_app_in(app_dirs, app_name.trim(), app_icon)
+            .map_or(Self::Other, Self::Application)
+    }
+
+    /// Whether `Open App` has a real target.
+    #[must_use]
+    pub fn is_openable(&self) -> bool {
+        matches!(self, Self::Application(_) | Self::FlexPopup { .. })
+    }
+
+    /// Whether the body is user content worth extracting (paths, links, OTPs).
+    ///
+    /// [`Feedback`](Self::Feedback) bodies carry the path that just failed to
+    /// open, so extracting them would re-offer the same broken targets.
+    #[must_use]
+    pub fn body_is_content(&self) -> bool {
+        !matches!(self, Self::Feedback)
+    }
+
+    /// Short name for trace logs.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Application(_) => "application",
+            Self::FlexPopup { .. } => "flex-popup",
+            Self::Feedback => "feedback",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Memo for [`Sender::classify`]: desktop entries do not change while the
+/// drawer is open, and every miss scans the whole application directory.
+type SenderCache = Mutex<HashMap<(String, Option<String>), Sender>>;
+
+/// Global memo backing [`Sender::classify`].
+fn sender_cache() -> &'static SenderCache {
+    static CACHE: OnceLock<SenderCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Open or focus a desktop application and switch workspace.
 pub fn open_application(app_name: &str) {
+    open_application_with(app_name, None);
+}
+
+/// [`open_application`] plus the notification's `app_icon` hint.
+///
+/// Notification `app_name`s are application *display names*, not binaries:
+/// KDE's crash reporter sends `"Crash Reporting System"`, which has no
+/// executable and no desktop `Name` — only `Icon=tools-report-bug`. The icon
+/// hint lets [`launch::find_app`] resolve such names to a real `.desktop`
+/// entry instead of silently spawning a nonexistent command.
+pub fn open_application_with(app_name: &str, app_icon: Option<&str>) {
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    open_application_seeded(app_name, app_icon, &launch::app_dirs(), &path_env);
+}
+
+/// [`open_application_with`] with explicit desktop dirs and `PATH` (test
+/// seams: no ambient scan, no real spawn).
+fn open_application_seeded(
+    app_name: &str,
+    app_icon: Option<&str>,
+    app_dirs: &[PathBuf],
+    path_env: &str,
+) {
     let clean = app_name.trim().to_lowercase();
+    let sender = Sender::classify_in(app_dirs, app_name, app_icon);
     log_notify_trace(&format!(
-        "[OPEN_APP] app_name='{app_name}', clean='{clean}'"
+        "[OPEN_APP] app_name='{app_name}', clean='{clean}', icon={app_icon:?}, sender={}",
+        sender.label()
     ));
-    if clean.is_empty() || clean == "wiremix" {
+
+    match sender {
+        // A flex-owned label: toggle the popup that owns the same state (the
+        // same machinery a keybind uses) instead of spawning a nonexistent
+        // binary named after the label.
+        Sender::FlexPopup { class, provider } => {
+            log_notify_trace(&format!(
+                "[FLEX_POPUP] '{clean}' -> flex {} (class='{class}')",
+                provider.join(" ")
+            ));
+            if !open_flex_popup(class, provider, crate::terminal::detect(), path_env) {
+                log_notify_trace(&format!(
+                    "[FLEX_POPUP_FAILED] could not open flex {provider:?}"
+                ));
+            }
+        }
+        // A real application: focus its window when one is already open,
+        // otherwise launch the desktop entry's `Exec` (field codes stripped,
+        // `Terminal=true` handled by the shared launch executor).
+        Sender::Application(entry) => {
+            // `hyprctl` is resolved against `path_env` (not the ambient
+            // `PATH`) so the stub-`PATH` seam never dispatches focus commands
+            // at live clients.
+            let hyprctl = crate::tools::resolve_tool("hyprctl", path_env);
+            if let Some(hyprctl) = hyprctl.as_deref() {
+                // Unset any active or global fullscreen lock across clients so
+                // window focus/launch is visible.
+                unset_fullscreen(hyprctl);
+                if focus_existing_client(hyprctl, &clean) {
+                    return;
+                }
+            }
+            log_notify_trace(&format!(
+                "[DESKTOP_RESOLVE] '{clean}' -> {} (Exec='{}')",
+                entry.id, entry.exec
+            ));
+            if !launch_desktop_entry(&entry, path_env) {
+                log_notify_trace(&format!(
+                    "[DESKTOP_RESOLVE_FAILED] could not launch {}",
+                    entry.id
+                ));
+            }
+        }
+        // Feedback and ordinary labels name no application; there is nothing
+        // to open, and guessing (spawning `notify-send`, focusing a terminal)
+        // would act on the wrong thing.
+        Sender::Feedback | Sender::Other => {
+            log_notify_trace(&format!(
+                "[OPEN_APP] no application behind '{clean}'; nothing to open"
+            ));
+        }
+    }
+}
+
+/// Launch a resolved desktop entry through [`crate::exec::launch`], reusing
+/// its field-code stripping and `Terminal=true` handling. `path_env` is the
+/// stub-`PATH` seam (`setsid` is resolved there).
+fn launch_desktop_entry(entry: &launch::DesktopEntry, path_env: &str) -> bool {
+    let stripped = launch::strip_field_codes(&entry.exec);
+    let mut tokens = stripped.split_whitespace().map(str::to_string);
+    let Some(program) = tokens.next() else {
+        return false;
+    };
+    let args: Vec<String> = tokens.collect();
+    // Read `$TERMINAL` only for `Terminal=true` entries, like the launch
+    // executor does (a plain GUI launch must never consult it).
+    let terminal = entry.terminal.then(crate::terminal::detect);
+    crate::exec::launch::execute_with(&entry.id, &program, &args, terminal, Some(path_env)).is_ok()
+}
+
+/// Query `hyprctl clients -j` and hand the parsed client list to `visit`.
+fn with_clients(hyprctl: &Path, visit: impl FnOnce(&[serde_json::Value])) {
+    let Ok(output) = Command::new(hyprctl)
+        .args(["clients", "-j"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
         return;
     }
-
-    // 0. Unset any active or global fullscreen lock across clients so window focus/launch is visible
-    if let Ok(output) = Command::new("hyprctl")
-        .args(["clients", "-j"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(json_str) = String::from_utf8(output.stdout) {
-                if let Ok(clients) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
-                    for client in &clients {
-                        let fs = client["fullscreen"].as_i64().unwrap_or(0);
-                        let fs_client = client["fullscreenClient"].as_i64().unwrap_or(0);
-                        if fs != 0 || fs_client != 0 {
-                            if let Some(addr) = client["address"].as_str() {
-                                log_notify_trace(&format!(
-                                    "[FULLSCREEN] Unsetting fullscreen for client address='{addr}'"
-                                ));
-                                let lua_cmd = format!(
-                                    "hl.dsp.window.fullscreen({{ action = \"unset\", window = \"address:{addr}\" }})"
-                                );
-                                let _ = Command::new("hyprctl")
-                                    .args(["dispatch", &lua_cmd])
-                                    .stdin(Stdio::null())
-                                    .stdout(Stdio::null())
-                                    .stderr(Stdio::null())
-                                    .status();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 1. Query hyprctl clients -j to locate matching window and switch focus
-    if let Ok(output) = Command::new("hyprctl")
-        .args(["clients", "-j"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(json_str) = String::from_utf8(output.stdout) {
-                if let Ok(clients) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
-                    if let Some((address, ws_id)) = find_matching_client(&clients, &clean) {
-                        let address_owned = address.to_string();
-                        log_notify_trace(&format!(
-                            "[FOCUS_DISPATCH_SYNC] Dispatching window focus for address='{address_owned}', ws={ws_id:?}"
-                        ));
-
-                        let lua_win =
-                            format!("hl.dsp.focus({{ window = \"address:{address_owned}\" }})");
-                        let _ = Command::new("hyprctl")
-                            .args(["dispatch", &lua_win])
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status();
-
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. Fallback: try Lua class focus dispatch
-    log_notify_trace(&format!(
-        "[CLASS_FOCUS] Trying fallback Lua class focus dispatch for '{clean}'"
-    ));
-    let lua_class_cmd = format!("hl.dsp.focus({{ window = \"class:{clean}\" }})");
-    let _ = Command::new("hyprctl")
-        .args(["dispatch", &lua_class_cmd])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    // 3. Fallback: launch application detached via setsid -f
-    let launch_target = if clean == "system" || clean == "packagekit" {
-        "kitty"
-    } else {
-        &clean
+    let Ok(json_str) = String::from_utf8(output.stdout) else {
+        return;
     };
+    let Ok(clients) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) else {
+        return;
+    };
+    visit(&clients);
+}
 
-    log_notify_trace(&format!(
-        "[LAUNCH_SPAWN] Spawning detached setsid -f '{launch_target}'"
-    ));
-    let _ = crate::spawn::spawn_detached(Path::new("setsid"), Path::new(launch_target), &[]);
+/// Unset any active or global fullscreen lock so window focus/launch is
+/// visible.
+fn unset_fullscreen(hyprctl: &Path) {
+    with_clients(hyprctl, |clients| {
+        for client in clients {
+            let fs = client["fullscreen"].as_i64().unwrap_or(0);
+            let fs_client = client["fullscreenClient"].as_i64().unwrap_or(0);
+            if fs == 0 && fs_client == 0 {
+                continue;
+            }
+            let Some(addr) = client["address"].as_str() else {
+                continue;
+            };
+            log_notify_trace(&format!(
+                "[FULLSCREEN] Unsetting fullscreen for client address='{addr}'"
+            ));
+            let lua_cmd = format!(
+                "hl.dsp.window.fullscreen({{ action = \"unset\", window = \"address:{addr}\" }})"
+            );
+            let _ = Command::new(hyprctl)
+                .args(["dispatch", &lua_cmd])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    });
+}
+
+/// Focus an already-open client window matching `clean`; `false` when no
+/// client matches (the caller launches the app instead).
+fn focus_existing_client(hyprctl: &Path, clean: &str) -> bool {
+    let mut focused = false;
+    with_clients(hyprctl, |clients| {
+        let Some((address, ws_id)) = find_matching_client(clients, clean) else {
+            return;
+        };
+        let address_owned = address.to_string();
+        log_notify_trace(&format!(
+            "[FOCUS_DISPATCH_SYNC] Dispatching window focus for address='{address_owned}', ws={ws_id:?}"
+        ));
+        let lua_win = format!("hl.dsp.focus({{ window = \"address:{address_owned}\" }})");
+        let _ = Command::new(hyprctl)
+            .args(["dispatch", &lua_win])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        focused = true;
+    });
+    focused
 }
 
 /// Do Not Disturb state machine.
@@ -896,13 +1291,134 @@ pub fn probe_quick_controls(controls: &mut QuickControls) {
     controls.mpris = probe_mpris();
 }
 
+/// A per-app preference with an optional lifetime.
+///
+/// Mutes are promised for one hour and expire on their own; priority is
+/// indefinite until toggled off. Storing `until` instead of a bare name is
+/// what makes "Silence … for 1 Hour" honest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppRule {
+    pub app: String,
+    /// Unix timestamp the rule stops applying; `None` = until removed.
+    #[serde(default)]
+    pub until: Option<u64>,
+}
+
+impl AppRule {
+    #[must_use]
+    pub fn is_active(&self, now: u64) -> bool {
+        self.until.is_none_or(|until| now < until)
+    }
+}
+
+/// Accept both the pre-rule store (`"muted_apps": ["Discord"]`) and the typed
+/// one, so an upgrade never resets the whole notification state.
+fn deserialize_app_rules<'de, D>(deserializer: D) -> Result<Vec<AppRule>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Name(String),
+        Rule(AppRule),
+    }
+
+    Ok(Vec::<Entry>::deserialize(deserializer)?
+        .into_iter()
+        .map(|entry| match entry {
+            Entry::Name(app) => AppRule { app, until: None },
+            Entry::Rule(rule) => rule,
+        })
+        .collect())
+}
+
+/// How long a dismissed or expired notification stays in the store.
+///
+/// History only renders the newest 30; the retained window keeps that archive
+/// useful across a session restart without letting the JSON grow forever.
+pub const ARCHIVE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// Complete runtime state stored in `$XDG_RUNTIME_DIR/flex-notify.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NotifyState {
     pub notifications: Vec<NotificationItem>,
     pub controls: QuickControls,
-    pub muted_apps: Vec<String>,
-    pub priority_apps: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_app_rules")]
+    pub muted_apps: Vec<AppRule>,
+    #[serde(default, deserialize_with = "deserialize_app_rules")]
+    pub priority_apps: Vec<AppRule>,
+}
+
+impl NotifyState {
+    /// Silence `app` (case-insensitively) until `until`.
+    pub fn mute_app(&mut self, app: &str, until: u64) {
+        self.muted_apps
+            .retain(|rule| !rule.app.eq_ignore_ascii_case(app));
+        self.muted_apps.push(AppRule {
+            app: app.to_string(),
+            until: Some(until),
+        });
+    }
+
+    /// Remove any mute rule for `app`, active or stale.
+    pub fn unmute_app(&mut self, app: &str) {
+        self.muted_apps
+            .retain(|rule| !rule.app.eq_ignore_ascii_case(app));
+    }
+
+    #[must_use]
+    pub fn is_muted(&self, app: &str, now: u64) -> bool {
+        self.muted_apps
+            .iter()
+            .any(|rule| rule.app.eq_ignore_ascii_case(app) && rule.is_active(now))
+    }
+
+    /// Flip the app between priority and ordinary feed ordering.
+    pub fn toggle_priority(&mut self, app: &str) {
+        if let Some(pos) = self
+            .priority_apps
+            .iter()
+            .position(|rule| rule.app.eq_ignore_ascii_case(app))
+        {
+            self.priority_apps.remove(pos);
+        } else {
+            self.priority_apps.push(AppRule {
+                app: app.to_string(),
+                until: None,
+            });
+        }
+    }
+
+    #[must_use]
+    pub fn is_priority(&self, app: &str, now: u64) -> bool {
+        self.priority_apps
+            .iter()
+            .any(|rule| rule.app.eq_ignore_ascii_case(app) && rule.is_active(now))
+    }
+
+    /// Permanently drop one notification (History's Delete key).
+    pub fn purge(&mut self, id: u32) {
+        self.notifications.retain(|item| item.id != id);
+    }
+
+    /// Permanently drop the archive (dismissed or sender-expired entries).
+    pub fn clear_history(&mut self, now: u64) {
+        self.notifications.retain(|item| !item.is_archived(now));
+    }
+
+    /// Drop rules that no longer apply and archive entries past retention.
+    fn settle(&mut self, now: u64) {
+        self.muted_apps.retain(|rule| rule.is_active(now));
+        self.priority_apps.retain(|rule| rule.is_active(now));
+        self.notifications.retain(|item| {
+            // Legacy archive entries have no `archived_at`; keep them until an
+            // explicit Clear History instead of guessing from their age.
+            item.archived_at
+                .or(item.expires_at)
+                .is_none_or(|archived_at| now.saturating_sub(archived_at) <= ARCHIVE_RETENTION_SECS)
+        });
+    }
 }
 
 /// Resolve the path to the runtime state JSON file.
@@ -922,7 +1438,11 @@ pub fn load_state(path: Option<&Path>) -> NotifyState {
     let file = path.unwrap_or(&default_path);
 
     if let Ok(content) = std::fs::read_to_string(file) {
-        if let Ok(state) = serde_json::from_str::<NotifyState>(&content) {
+        if let Ok(mut state) = serde_json::from_str::<NotifyState>(&content) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            state.settle(now);
             return state;
         }
     }
@@ -1098,12 +1618,27 @@ pub fn play_notification_sound_with_path(
 /// D-Bus Notification Service implementation of `org.freedesktop.Notifications`.
 pub struct NotificationServer {
     pub state_path: Option<PathBuf>,
+    /// `PATH` used to spawn toast overlays; `None` inherits the daemon's.
+    /// Tests pin it to a stub farm so no window actually opens.
+    toast_path_env: Option<String>,
 }
 
 impl NotificationServer {
     #[must_use]
     pub fn new(state_path: Option<PathBuf>) -> Self {
-        Self { state_path }
+        Self {
+            state_path,
+            toast_path_env: None,
+        }
+    }
+
+    /// [`new`] with an explicit `PATH` for toast spawning (test seam).
+    #[must_use]
+    pub fn with_toast_path(state_path: Option<PathBuf>, path_env: impl Into<String>) -> Self {
+        Self {
+            state_path,
+            toast_path_env: Some(path_env.into()),
+        }
     }
 }
 
@@ -1142,7 +1677,10 @@ impl NotificationServer {
     ) -> zbus::fdo::Result<()> {
         let mut state = load_state(self.state_path.as_deref());
         if let Some(item) = state.notifications.iter_mut().find(|n| n.id == id) {
-            item.is_dismissed = true;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            item.archive(now);
             let _ = save_state(&state, self.state_path.as_deref());
         }
         let _ = Self::notification_closed(&emitter, id, 3).await;
@@ -1218,10 +1756,38 @@ impl NotificationServer {
             }
         }
 
+        // `transient` (freedesktop hint): show it, never keep it. flex's own
+        // failure feedback ("File not found", …) posts this way, so a failed
+        // tap cannot leave a feed entry behind or bump the unread badge.
+        let transient = matches!(
+            hints.get("transient"),
+            Some(zbus::zvariant::Value::Bool(true))
+        );
+        if transient {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            if !load_state(self.state_path.as_deref())
+                .controls
+                .dnd
+                .is_active(now)
+            {
+                spawn_transient_toast_with_path(&summary, &body, self.toast_path_env.as_deref());
+            }
+            return 0;
+        }
+
         let mut state = load_state(self.state_path.as_deref());
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
+
+        // freedesktop `expire_timeout`: -1 asks for the server default (flex
+        // keeps the entry until dismissed, because this is a notification
+        // center), 0 means never, and a positive value retires the entry after
+        // the sender's own lifetime. Critical alerts are never expired.
+        let expires_at = (expire_timeout > 0 && urgency != Urgency::Critical)
+            .then(|| now + u64::from(expire_timeout.unsigned_abs()).div_ceil(1000));
 
         let target_id = if replaces_id > 0 {
             replaces_id
@@ -1229,10 +1795,7 @@ impl NotificationServer {
             state.notifications.iter().map(|n| n.id).max().unwrap_or(0) + 1
         };
 
-        let is_app_muted = state
-            .muted_apps
-            .iter()
-            .any(|a| a.eq_ignore_ascii_case(&app_name));
+        let is_app_muted = state.is_muted(&app_name, now);
 
         if let Some(existing) = state.notifications.iter_mut().find(|n| n.id == target_id) {
             existing.app_name = app_name;
@@ -1241,6 +1804,7 @@ impl NotificationServer {
             existing.urgency = urgency;
             existing.timestamp = now;
             existing.progress = progress;
+            existing.expires_at = expires_at;
             if !app_icon.is_empty() {
                 existing.app_icon = Some(app_icon);
             }
@@ -1254,10 +1818,12 @@ impl NotificationServer {
                 existing.actions = parsed_actions;
             }
             existing.is_dismissed = false;
+            existing.archived_at = None;
         } else {
             let mut item = NotificationItem::new(target_id, app_name, summary, body, urgency);
             item.timestamp = now;
             item.progress = progress;
+            item.expires_at = expires_at;
             if !app_icon.is_empty() {
                 item.app_icon = Some(app_icon);
             }
@@ -1280,7 +1846,11 @@ impl NotificationServer {
 
         if !is_dnd && !is_app_muted && !suppress_sound {
             play_notification_sound(urgency, false);
-            spawn_toast(target_id, self.state_path.as_deref());
+            spawn_toast_with_path(
+                target_id,
+                self.state_path.as_deref(),
+                self.toast_path_env.as_deref(),
+            );
         }
 
         target_id
@@ -1376,6 +1946,31 @@ pub fn format_toast_header(
         format!(
             "{prefix}\x1b[1m{app_name}\x1b[0m · {truncated_summary}{spaces_str}\x1b[2m{rel}\x1b[0m"
         )
+    }
+}
+
+/// Auto-dismiss delay used when a sender asked for the server default.
+pub const TOAST_DEFAULT_SECS: u64 = 4;
+/// Critical alerts stay on screen a little longer than ordinary toasts.
+pub const TOAST_CRITICAL_SECS: u64 = 7;
+/// Upper bound for a sender-requested toast lifetime: a banner must never
+/// pin itself to the screen for minutes because of a stray timeout.
+pub const TOAST_MAX_SECS: u64 = 30;
+
+/// Auto-dismiss delay for a toast card at `now`.
+///
+/// A positive `expire_timeout` is honored (clamped to 1..=[`TOAST_MAX_SECS`])
+/// relative to [`NotificationItem::expires_at`]; otherwise the server default
+/// applies.
+#[must_use]
+pub fn toast_timeout_secs(item: &NotificationItem, now: u64) -> u64 {
+    if let Some(at) = item.expires_at {
+        return at.saturating_sub(now).clamp(1, TOAST_MAX_SECS);
+    }
+    if item.urgency == Urgency::Critical {
+        TOAST_CRITICAL_SECS
+    } else {
+        TOAST_DEFAULT_SECS
     }
 }
 
@@ -1508,6 +2103,29 @@ pub fn format_toast_card(
     lines.join("\n")
 }
 
+/// Kitty flags shared by every toast window (stored and transient).
+const TOAST_KITTY_ARGS: &[&str] = &[
+    "--class",
+    "flex-notify-toast",
+    "-o",
+    "font_size=11",
+    "-o",
+    "remember_window_size=no",
+    "-o",
+    "initial_window_width=50c",
+    "-o",
+    "initial_window_height=6c",
+    "-o",
+    "window_padding_width=0",
+    "-o",
+    "window_padding_height=0",
+];
+
+/// The `kitty …` command prefix for a toast window.
+fn toast_kitty_cmd() -> String {
+    format!("kitty {}", TOAST_KITTY_ARGS.join(" "))
+}
+
 /// Spawn a transient toast overlay for a newly-arrived notification.
 ///
 /// Launches `kitty --class flex-notify-toast -o font_size=11 -o remember_window_size=no
@@ -1524,9 +2142,7 @@ pub fn spawn_toast(id: u32, state_path: Option<&Path>) {
 pub fn spawn_toast_with_path(id: u32, state_path: Option<&Path>, path_override: Option<&str>) {
     let state_arg =
         state_path.map_or_else(String::new, |p| format!(" --state-file '{}'", p.display()));
-    let cmd = format!(
-        "kitty --class flex-notify-toast -o font_size=11 -o remember_window_size=no -o initial_window_width=50c -o initial_window_height=6c -o window_padding_width=0 -o window_padding_height=0 -e flex-notify{state_arg} toast {id}"
-    );
+    let cmd = format!("{} -e flex-notify{state_arg} toast {id}", toast_kitty_cmd());
     // Double-fork via `sh -c '… &'`: the grandchild is reparented to init so
     // no daemon FDs (including the zbus socket) are inherited.
     // Do NOT redirect kitty's stdio: kitty opens its own PTY for the child
@@ -1552,6 +2168,42 @@ pub fn spawn_toast_with_path(id: u32, state_path: Option<&Path>, path_override: 
     }
     // Reaped on a waiter thread: the intermediate `sh` exits immediately and
     // would otherwise linger as a zombie under the long-lived daemon.
+    let _ = crate::spawn::spawn_and_reap(&mut toast);
+}
+
+/// Spawn a toast card from text, without storing it.
+///
+/// [`spawn_toast`] renders a stored notification by id; feedback that must not
+/// be persisted (the freedesktop `transient` hint — e.g. flex's own
+/// "File not found") has no id to look up, so the text travels in argv and
+/// nothing is written to the state store.
+fn spawn_transient_toast_with_path(summary: &str, body: &str, path_override: Option<&str>) {
+    let ambient = std::env::var("PATH").unwrap_or_default();
+    let path_env = path_override.unwrap_or(&ambient);
+    let Some(bin) = sibling_binary("flex-notify", path_env) else {
+        return;
+    };
+    let sh_bin = match path_override {
+        Some(path_env) => match crate::tools::resolve_tool("sh", path_env) {
+            Some(path) => path,
+            None => return,
+        },
+        None => PathBuf::from("sh"),
+    };
+    // The text arrives as positional parameters, never spliced into the
+    // command string: a summary/body containing quotes, `$` or `;` must stay
+    // inert. Same `sh -c '… &'` double-fork as [`spawn_toast_with_path`], so
+    // the daemon's FDs are not inherited.
+    let script = format!("{} -e \"$0\" toast-text \"$1\" \"$2\" &", toast_kitty_cmd());
+    let mut toast = Command::new(&sh_bin);
+    toast
+        .args(["-c", &script, &bin.to_string_lossy(), summary, body])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(path_env) = path_override {
+        toast.env("PATH", path_env);
+    }
     let _ = crate::spawn::spawn_and_reap(&mut toast);
 }
 
@@ -1690,8 +2342,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("flex-notify-srv-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("srv-state.json");
+        let (stubs, _log) = toast_dir("srv-stubs");
 
-        let srv = NotificationServer::new(Some(path.clone()));
+        let srv = NotificationServer::with_toast_path(Some(path.clone()), stubs.to_string_lossy());
 
         let mut hints = std::collections::HashMap::new();
         hints.insert("urgency".to_string(), zbus::zvariant::Value::U8(2));
@@ -1737,6 +2390,38 @@ mod tests {
         assert_eq!(s2.notifications[0].progress, Some(1.0));
 
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&stubs);
+    }
+
+    #[test]
+    fn transient_notifications_are_toasted_but_never_stored() {
+        let (stubs, kitty_log) = toast_dir("srv-transient");
+        let path = stubs.join("state.json");
+        let srv = NotificationServer::with_toast_path(Some(path.clone()), stubs.to_string_lossy());
+
+        let mut hints = std::collections::HashMap::new();
+        hints.insert("transient".to_string(), zbus::zvariant::Value::Bool(true));
+
+        let id = srv.notify(
+            "flex-notify".to_string(),
+            0,
+            String::new(),
+            "File not found".to_string(),
+            "/tmp/gone.png".to_string(),
+            vec![],
+            hints,
+            -1,
+        );
+
+        // No id, no feed entry, no unread badge — just the card on screen.
+        assert_eq!(id, 0);
+        assert!(load_state(Some(&path)).notifications.is_empty());
+        let logged = read_log_soon(&kitty_log);
+        assert!(
+            logged.contains("File not found") && logged.contains("/tmp/gone.png"),
+            "the toast still renders the payload: {logged:?}"
+        );
+        let _ = std::fs::remove_dir_all(&stubs);
     }
 
     #[test]
@@ -1797,6 +2482,224 @@ mod tests {
         assert_eq!(image_mime(&dir.join("ghost.png")), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lifecycle_predicate_handles_snooze_and_sender_expiry() {
+        let now = 1_000;
+        let mut item = NotificationItem::new(1, "App", "summary", "body", Urgency::Normal);
+        assert!(item.is_active(now));
+        assert!(!item.is_archived(now));
+
+        item.is_snoozed = true;
+        item.snooze_until = Some(now + 60);
+        assert!(!item.is_active(now), "a live snooze hides the item");
+        assert!(!item.is_archived(now), "a snooze is not an archive");
+        assert!(item.is_active(now + 60), "an elapsed snooze wakes up");
+
+        item.is_snoozed = false;
+        item.snooze_until = None;
+        item.expires_at = Some(now + 10);
+        assert!(item.is_active(now));
+        assert!(!item.is_archived(now));
+        assert!(
+            !item.is_active(now + 10),
+            "elapsed sender timeout retires it"
+        );
+        assert!(item.is_archived(now + 10));
+
+        item.is_dismissed = true;
+        assert!(!item.is_active(now));
+        assert!(item.is_archived(now));
+    }
+
+    #[test]
+    fn app_rules_expire_and_mute_is_undoable() {
+        let mut state = NotifyState::default();
+        state.mute_app("Discord", 1_000 + 3_600);
+
+        assert!(
+            state.is_muted("discord", 1_000),
+            "rules match case-insensitively"
+        );
+        assert!(
+            !state.is_muted("discord", 1_000 + 3_600),
+            "the promised hour actually ends"
+        );
+
+        state.mute_app("DISCORD", 2_000);
+        assert_eq!(
+            state.muted_apps.len(),
+            1,
+            "a refresh replaces, never stacks"
+        );
+
+        state.unmute_app("discord");
+        assert!(!state.is_muted("Discord", 1_500));
+
+        state.toggle_priority("Slack");
+        assert!(state.is_priority("slack", 0));
+        state.toggle_priority("SLACK");
+        assert!(!state.is_priority("Slack", 0));
+    }
+
+    #[test]
+    fn legacy_string_rules_still_deserialize() {
+        let mut value = serde_json::to_value(NotifyState::default()).expect("state to json");
+        value["muted_apps"] = serde_json::json!(["Discord"]);
+        value["priority_apps"] = serde_json::json!(["System"]);
+
+        let state: NotifyState = serde_json::from_value(value).expect("legacy store loads");
+        assert_eq!(
+            state.muted_apps,
+            vec![AppRule {
+                app: "Discord".to_string(),
+                until: None,
+            }]
+        );
+        assert_eq!(
+            state.priority_apps,
+            vec![AppRule {
+                app: "System".to_string(),
+                until: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn load_prunes_expired_rules_and_ancient_archives() {
+        let dir =
+            std::env::temp_dir().join(format!("flex-notify-retention-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("retention.json");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
+        let mut ancient = NotificationItem::new(1, "A", "ancient", "", Urgency::Normal);
+        ancient.archive(now - ARCHIVE_RETENTION_SECS - 10);
+
+        let mut still_active = NotificationItem::new(2, "B", "active", "", Urgency::Normal);
+        still_active.timestamp = now - ARCHIVE_RETENTION_SECS - 10;
+
+        let state = NotifyState {
+            notifications: vec![ancient, still_active],
+            muted_apps: vec![AppRule {
+                app: "Expired".to_string(),
+                until: Some(now - 1),
+            }],
+            priority_apps: vec![AppRule {
+                app: "Kept".to_string(),
+                until: Some(now + 3_600),
+            }],
+            ..NotifyState::default()
+        };
+        save_state(&state, Some(&path)).expect("saved");
+
+        let loaded = load_state(Some(&path));
+        assert!(
+            loaded.notifications.iter().any(|n| n.id == 2),
+            "active notifications survive retention"
+        );
+        assert!(
+            !loaded.notifications.iter().any(|n| n.id == 1),
+            "archived entries past retention are dropped"
+        );
+        assert!(loaded.muted_apps.is_empty(), "expired rules are pruned");
+        assert_eq!(loaded.priority_apps.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toast_timeout_follows_the_sender_deadline_within_bounds() {
+        let now = 100;
+        let mut item = NotificationItem::new(1, "App", "summary", "body", Urgency::Normal);
+        assert_eq!(toast_timeout_secs(&item, now), TOAST_DEFAULT_SECS);
+
+        item.urgency = Urgency::Critical;
+        assert_eq!(toast_timeout_secs(&item, now), TOAST_CRITICAL_SECS);
+
+        item.urgency = Urgency::Normal;
+        item.expires_at = Some(now + 2);
+        assert_eq!(toast_timeout_secs(&item, now), 2);
+        item.expires_at = Some(now + 999);
+        assert_eq!(toast_timeout_secs(&item, now), TOAST_MAX_SECS);
+        item.expires_at = Some(now);
+        assert_eq!(toast_timeout_secs(&item, now), 1);
+        item.expires_at = Some(now - 50);
+        assert_eq!(toast_timeout_secs(&item, now), 1);
+    }
+
+    #[test]
+    fn notify_honors_expire_timeout_but_never_for_critical() {
+        let dir = std::env::temp_dir().join(format!("flex-notify-expiry-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("expiry.json");
+        let (stubs, _log) = toast_dir("expiry-stubs");
+        let srv = NotificationServer::with_toast_path(Some(path.clone()), stubs.to_string_lossy());
+
+        let id = srv.notify(
+            "App".to_string(),
+            0,
+            String::new(),
+            "Short lived".to_string(),
+            String::new(),
+            vec![],
+            std::collections::HashMap::new(),
+            1500,
+        );
+        let item = load_state(Some(&path))
+            .notifications
+            .into_iter()
+            .find(|n| n.id == id)
+            .expect("stored");
+        let lifetime = item.expires_at.expect("expiry stored") - item.timestamp;
+        assert!(
+            (1..=2).contains(&lifetime),
+            "1.5s is rounded up to whole seconds, got {lifetime}"
+        );
+
+        // Replacing with the server default clears the old deadline.
+        srv.notify(
+            "App".to_string(),
+            id,
+            String::new(),
+            "Now default".to_string(),
+            String::new(),
+            vec![],
+            std::collections::HashMap::new(),
+            -1,
+        );
+        let replaced = load_state(Some(&path))
+            .notifications
+            .into_iter()
+            .find(|n| n.id == id)
+            .expect("replaced");
+        assert_eq!(replaced.expires_at, None);
+
+        // Critical alerts ignore even an explicit short timeout.
+        let mut hints = std::collections::HashMap::new();
+        hints.insert("urgency".to_string(), zbus::zvariant::Value::U8(2));
+        let critical = srv.notify(
+            "App".to_string(),
+            0,
+            String::new(),
+            "Critical".to_string(),
+            String::new(),
+            vec![],
+            hints,
+            1000,
+        );
+        let critical = load_state(Some(&path))
+            .notifications
+            .into_iter()
+            .find(|n| n.id == critical)
+            .expect("critical stored");
+        assert_eq!(critical.expires_at, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&stubs);
     }
 
     #[test]
@@ -1927,6 +2830,407 @@ mod tests {
         );
         assert_eq!(first_manager(&["nautilus", "nemo"], &path_env), None);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_application_launches_resolved_desktop_entry() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("flex-notify-openapp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let apps = dir.join("applications");
+        std::fs::create_dir_all(&apps).expect("apps dir");
+        std::fs::write(
+            apps.join("org.example.viewer.desktop"),
+            "[Desktop Entry]\nName=Example Viewer\nExec=example-viewer --open\nIcon=tools-report-bug\nTerminal=false\n",
+        )
+        .expect("desktop entry");
+
+        let log = dir.join("spawn.log");
+        let stub = dir.join("setsid");
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n", log.display()),
+        )
+        .expect("setsid stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let path_env = dir.to_string_lossy().into_owned();
+
+        // The KDE crash-reporter shape: a display name with no executable,
+        // linked to its desktop entry only by the `app_icon` hint.
+        open_application_seeded(
+            "Crash Reporting System",
+            Some("tools-report-bug"),
+            &[apps],
+            &path_env,
+        );
+
+        let spawned = std::fs::read_to_string(&log).expect("setsid stub ran");
+        assert!(spawned.contains("example-viewer"), "spawned: {spawned:?}");
+        assert!(spawned.contains("--open"), "spawned: {spawned:?}");
+        assert!(
+            !spawned.contains("crash reporting system"),
+            "the display name must not be spawned as a binary: {spawned:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sender_classification_drives_openability() {
+        let dir = std::env::temp_dir().join(format!("flex-notify-sender-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let apps = dir.join("applications");
+        std::fs::create_dir_all(&apps).expect("apps dir");
+        std::fs::write(
+            apps.join("org.example.viewer.desktop"),
+            "[Desktop Entry]\nName=Example Viewer\nExec=example-viewer --open\nIcon=tools-report-bug\nTerminal=false\n",
+        )
+        .expect("desktop entry");
+        let dirs = vec![apps];
+
+        // Real applications resolve by display name or by the icon hint.
+        assert!(matches!(
+            Sender::classify_in(&dirs, "Example Viewer", None),
+            Sender::Application(_)
+        ));
+        assert!(matches!(
+            Sender::classify_in(&dirs, "Crash Reporting System", Some("tools-report-bug")),
+            Sender::Application(_)
+        ));
+        // flex-owned labels are not applications: `Cliphist` owns a popup and
+        // `flex-notify` is flex's feedback channel.
+        assert!(matches!(
+            Sender::classify_in(&dirs, "Cliphist", None),
+            Sender::FlexPopup { .. }
+        ));
+        assert_eq!(
+            Sender::classify_in(&dirs, "flex-notify", None),
+            Sender::Feedback
+        );
+
+        // Labels with no application behind them are `Other`, never openable.
+        for label in ["notify-send", "e2e", "wiremix", "System", "   "] {
+            let sender = Sender::classify_in(&dirs, label, None);
+            assert_eq!(sender, Sender::Other, "{label:?}");
+            assert!(!sender.is_openable(), "{label:?}");
+        }
+
+        // Only feedback bodies are not user content (they are failed paths).
+        assert!(!Sender::Feedback.body_is_content());
+        assert!(Sender::Other.body_is_content());
+        assert!(Sender::classify_in(&dirs, "Example Viewer", None).body_is_content());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_senders_launch_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("flex-notify-noapp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        // Any spawn attempt would resolve these stubs and log argv.
+        let log = dir.join("spawn.log");
+        for name in ["setsid", "kitty", "hyprctl", "notify-send"] {
+            let stub = dir.join(name);
+            std::fs::write(
+                &stub,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> '{}'\n",
+                    log.display()
+                ),
+            )
+            .expect("stub");
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let path_env = dir.to_string_lossy().into_owned();
+
+        for label in ["notify-send", "e2e", "wiremix", "System"] {
+            open_application_seeded(label, None, &[], &path_env);
+        }
+
+        assert!(
+            !log.exists(),
+            "a label with no application behind it must not spawn anything: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_application_routes_flex_owned_labels_to_their_popup() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("flex-notify-flexrel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let chmod = |path: &std::path::Path| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        };
+        // `pgrep` says nothing is open, so the toggle spawns; `setsid` logs its
+        // argv and execs the terminal stub, which logs its own argv.
+        let pgrep = dir.join("pgrep");
+        std::fs::write(&pgrep, "#!/bin/sh\nexit 1\n").expect("pgrep stub");
+        chmod(&pgrep);
+        let kitty_log = dir.join("kitty.log");
+        let kitty = dir.join("kitty");
+        std::fs::write(
+            &kitty,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\" > '{}'\n",
+                kitty_log.display()
+            ),
+        )
+        .expect("kitty stub");
+        chmod(&kitty);
+        let setsid_log = dir.join("setsid.log");
+        let setsid = dir.join("setsid");
+        std::fs::write(
+            &setsid,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nkitty=\"$2\"\nshift 2\nexec \"$kitty\" \"$@\"\n",
+                setsid_log.display()
+            ),
+        )
+        .expect("setsid stub");
+        chmod(&setsid);
+        // The popup must call the dispatcher by absolute path: the drawer's
+        // `PATH` (inherited from waybar) has no `~/.local/bin`.
+        let flex_stub = dir.join("flex");
+        std::fs::write(&flex_stub, "#!/bin/sh\nexit 0\n").expect("flex stub");
+        chmod(&flex_stub);
+        let path_env = dir.to_string_lossy().into_owned();
+
+        // `Cliphist` is flex's own label for the clipboard store: no binary,
+        // no desktop entry — the tap must open the `flex clip` popup.
+        open_application_seeded("Cliphist", None, &[], &path_env);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let spawned = loop {
+            if let Ok(body) = std::fs::read_to_string(&kitty_log) {
+                break body;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "kitty stub never ran: {}",
+                kitty_log.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(
+            spawned.contains("flex-menu-wide"),
+            "wide clip popup class: {spawned:?}"
+        );
+        assert!(
+            spawned.contains("POPUP_KITTY=1"),
+            "popup marker env: {spawned:?}"
+        );
+        assert!(
+            spawned.lines().any(|line| line == "clip"),
+            "runs `flex clip`: {spawned:?}"
+        );
+        assert!(
+            spawned
+                .lines()
+                .any(|line| line.ends_with("/flex") && line.starts_with('/')),
+            "absolute dispatcher path, not a bare `flex`: {spawned:?}"
+        );
+        assert!(
+            !spawned.lines().any(|line| line == "flex"),
+            "the popup must not rely on `flex` being on `PATH`: {spawned:?}"
+        );
+        // Session-detached: the drawer's pty closes right after the action, so
+        // the popup must be spawned through `setsid -f` or it dies of SIGHUP.
+        let detached = std::fs::read_to_string(&setsid_log).expect("setsid stub ran");
+        assert!(
+            detached.lines().next() == Some("-f"),
+            "session-detached spawn: {detached:?}"
+        );
+        assert!(
+            !detached.contains("cliphist"),
+            "must not spawn the nonexistent `cliphist` binary: {detached:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write an executable stub script (`chmod 755`).
+    fn write_stub(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, body).expect("stub");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    /// Scratch dir with logging stubs for the toast chain (`sh`, `kitty`,
+    /// `flex-notify`), plus the log where the `kitty` stub records its argv.
+    fn toast_dir(name: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("flex-notify-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let log = dir.join("kitty.log");
+        write_stub(
+            &dir.join("kitty"),
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n", log.display()),
+        );
+        // Real `sh` semantics (the script backgrounds kitty), but every bare
+        // command inside it resolves through the stub `PATH`.
+        write_stub(&dir.join("sh"), "#!/bin/sh\nexec /bin/sh \"$@\"\n");
+        // Exists only so the toast binary resolves; the stub kitty never runs it.
+        write_stub(&dir.join("flex-notify"), "#!/bin/sh\nexit 0\n");
+        (dir, log)
+    }
+
+    /// Scratch dir with a logging `notify-send` stub, plus its log path.
+    fn notifier_dir(name: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("flex-notify-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let log = dir.join("notify.log");
+        write_stub(
+            &dir.join("notify-send"),
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n", log.display()),
+        );
+        (dir, log)
+    }
+
+    /// Read a stub log, waiting briefly: the toast chain runs `sh -c '… &'`,
+    /// so the `kitty` stub may still be starting when the spawn returns.
+    fn read_log_soon(log: &Path) -> String {
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(log) {
+                if !text.trim().is_empty() {
+                    return text;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("stub never logged: {}", log.display());
+    }
+
+    #[test]
+    fn open_file_reports_missing_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "flex-notify-openfile-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path_env = dir.to_string_lossy().into_owned();
+
+        let failure = open_file_with("/nonexistent/flex-ghost.png", &path_env).expect("reported");
+        assert_eq!(failure.summary, "File not found");
+        assert_eq!(failure.detail, "/nonexistent/flex-ghost.png");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_file_launches_existing_paths_without_feedback() {
+        let dir = std::env::temp_dir().join(format!(
+            "flex-notify-openfile-exists-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let file = dir.join("kept.txt");
+        std::fs::write(&file, b"hello").expect("fixture");
+        let xdg_log = dir.join("xdg.log");
+        write_stub(
+            &dir.join("xdg-open"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+                xdg_log.display()
+            ),
+        );
+        // `setsid -f <xdg-open> <file>`: run the stub directly.
+        write_stub(
+            &dir.join("setsid"),
+            "#!/bin/sh\nbin=\"$2\"\nshift 2\nexec \"$bin\" \"$@\"\n",
+        );
+        let path_env = dir.to_string_lossy().into_owned();
+
+        assert_eq!(
+            open_file_with(&file.to_string_lossy(), &path_env),
+            None,
+            "an existing file reports nothing"
+        );
+        let opened = std::fs::read_to_string(&xdg_log).expect("xdg-open stub ran");
+        assert_eq!(opened.trim(), file.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_dir_reports_missing_folders_and_ignores_empty_input() {
+        let dir = std::env::temp_dir().join(format!(
+            "flex-notify-opendir-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path_env = dir.to_string_lossy().into_owned();
+
+        // Deleted parent folder: say so instead of doing nothing.
+        let failure =
+            open_dir_with_path("/nonexistent/flex-dir/file.png", &path_env).expect("reported");
+        assert_eq!(failure.summary, "Folder not found");
+        assert_eq!(failure.detail, "/nonexistent/flex-dir");
+
+        // Nothing to point at (empty label): stay silent.
+        assert_eq!(open_dir_with_path("   ", &path_env), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_failure_posts_transiently_so_nothing_is_stored() {
+        let (dir, log) = notifier_dir("report");
+        let path_env = dir.to_string_lossy().into_owned();
+
+        report_failure_with("File not found", "/tmp/gone.png", &path_env);
+
+        let logged = read_log_soon(&log);
+        let args: Vec<&str> = logged.lines().collect();
+        assert_eq!(
+            args,
+            [
+                "-a",
+                "flex-notify",
+                "-h",
+                "boolean:transient:true",
+                "File not found",
+                "/tmp/gone.png"
+            ],
+            "the transient hint keeps feedback out of the feed and the badge"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transient_toast_renders_from_argv_only() {
+        let (dir, log) = toast_dir("transient");
+        let path_env = dir.to_string_lossy().into_owned();
+        let body = "/tmp/gone; rm -rf $HOME";
+
+        spawn_transient_toast_with_path("File not found", body, Some(&path_env));
+
+        let logged = read_log_soon(&log);
+        let args: Vec<&str> = logged.lines().collect();
+        assert_eq!(args.first(), Some(&"--class"));
+        assert_eq!(args.get(1), Some(&"flex-notify-toast"));
+        // The card text is argv, not a state lookup, and the body arrives
+        // whole: shell metacharacters in a path stay inert.
+        assert_eq!(
+            &args[args.len() - 3..],
+            ["toast-text", "File not found", body],
+            "full argv: {args:?}"
+        );
+        let toast_bin = dir.join("flex-notify").to_string_lossy().into_owned();
+        assert!(
+            args.contains(&toast_bin.as_str()),
+            "the toast binary resolves by absolute path, not PATH lookup: {args:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -8,8 +8,10 @@
 //!   desktop-ids (user overrides system), matching the bash assoc-array.
 //! - Parsed keys: `Name` (first wins), `Exec` (first wins), `Terminal`
 //!   (last wins), `NoDisplay`/`Hidden` (last wins, skip when `true`).
-//!   `OnlyShowIn`/`NotShowIn`/`Icon` are parsed and ignored (shown
-//!   everywhere, exactly like the bash version which never reads them).
+//!   `OnlyShowIn`/`NotShowIn` are parsed and ignored (shown everywhere,
+//!   exactly like the bash version which never reads them). `Icon` (first
+//!   wins) is kept for [`find_app`]: notification server `app_icon` hints
+//!   name-app resolution uses it.
 //! - Skipped (never panic): unreadable files, missing `Name`/`Exec`,
 //!   `NoDisplay`/`Hidden` set. Only the unreadable/field-less class is
 //!   malformed and logs to stderr; `NoDisplay`/`Hidden` entries are skipped
@@ -49,6 +51,9 @@ pub struct DesktopEntry {
     pub exec: String,
     /// Whether `Terminal` is `true` (last occurrence wins).
     pub terminal: bool,
+    /// Icon name or path (`Icon`, first occurrence). Only used to resolve a
+    /// notification `app_icon` hint back to an entry ([`find_app`]).
+    pub icon: Option<String>,
 }
 
 /// Application directories in bash order (system, then user override).
@@ -102,6 +107,7 @@ fn scan(dirs: &[PathBuf], report_malformed: &dyn Fn(&Path)) -> Vec<DesktopEntry>
                     name,
                     exec,
                     terminal,
+                    icon,
                 } => {
                     seen.insert(
                         id.clone(),
@@ -110,6 +116,7 @@ fn scan(dirs: &[PathBuf], report_malformed: &dyn Fn(&Path)) -> Vec<DesktopEntry>
                             name,
                             exec,
                             terminal,
+                            icon,
                         },
                     );
                 }
@@ -241,6 +248,78 @@ pub fn find_exec_in(dirs: &[PathBuf], id: &str) -> Option<(String, bool)> {
     None
 }
 
+/// Normalize an app name, desktop-id or icon for comparison: lowercase with
+/// every non-alphanumeric character dropped (`"Crash Reporting System"` →
+/// `"crashreportingsystem"`, `org.kde.Foo.desktop` → `orgkdefoodesktop`).
+fn normalize_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Resolve an application *display name* to an installed desktop entry.
+///
+/// Notification servers hand over an application name, not an executable:
+/// `"Crash Reporting System"` (a KDE notifyrc name) has no binary and no
+/// desktop `Name`, only a shared `Icon=tools-report-bug`. [`find_app`] tries,
+/// in order, the desktop-id (`firefox.desktop` / `firefox`), the `Name`
+/// (`"Firefox"`), then — as a last resort — the `app_icon` hint matched
+/// against the entry's `Icon`.
+///
+/// Only entries [`scan_dirs`] would show are considered, so `NoDisplay` and
+/// `Hidden` entries never hijack the lookup.
+#[must_use]
+pub fn find_app(name: &str, icon: Option<&str>) -> Option<DesktopEntry> {
+    find_app_in(&app_dirs(), name, icon)
+}
+
+/// [`find_app`] over explicit directories (tests/fixtures).
+#[must_use]
+pub fn find_app_in(dirs: &[PathBuf], name: &str, icon: Option<&str>) -> Option<DesktopEntry> {
+    let wanted = normalize_key(name);
+    if wanted.is_empty() {
+        return None;
+    }
+    // Icon hints may be paths (`file:///…/icon.png`); only bare names match
+    // an `Icon=` key.
+    let icon_key = icon
+        .filter(|hint| !hint.is_empty() && !hint.contains('/'))
+        .map(normalize_key)
+        .filter(|key| !key.is_empty());
+    let entries = scan_silently(dirs);
+
+    // 1. Desktop-id, with or without the `.desktop` suffix.
+    if let Some(entry) = entries.iter().find(|entry| {
+        let stem = entry.id.strip_suffix(".desktop").unwrap_or(&entry.id);
+        normalize_key(&entry.id) == wanted || normalize_key(stem) == wanted
+    }) {
+        return Some(entry.clone());
+    }
+
+    // 2. Display name.
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| normalize_key(&entry.name) == wanted)
+    {
+        return Some(entry.clone());
+    }
+
+    // 3. Icon hint (the notifyrc case: the display name matches nothing and
+    // the shared `Icon=` is the only link to the entry).
+    let icon_key = icon_key?;
+    entries
+        .iter()
+        .find(|entry| {
+            entry
+                .icon
+                .as_deref()
+                .is_some_and(|entry_icon| normalize_key(entry_icon) == icon_key)
+        })
+        .cloned()
+}
+
 /// Strip `.desktop` field codes (` %U`, ` %F`, …) and surrounding spaces.
 ///
 /// The regex is `sed -E 's/ %[A-Za-z]//g; s/^ *//; s/ *$//'`.
@@ -305,6 +384,8 @@ enum Parsed {
         exec: String,
         /// `Terminal` flag (last occurrence wins).
         terminal: bool,
+        /// `Icon` (first occurrence), kept for [`find_app`].
+        icon: Option<String>,
     },
     /// Skipped by design: `NoDisplay=true` or `Hidden=true`. Silent.
     Hidden,
@@ -326,6 +407,7 @@ fn read_entry(path: &Path) -> Parsed {
     let text = String::from_utf8_lossy(&bytes);
     let mut name: Option<String> = None;
     let mut exec: Option<String> = None;
+    let mut icon: Option<String> = None;
     let mut terminal = false;
     let mut nodisplay = false;
     let mut hidden = false;
@@ -345,11 +427,16 @@ fn read_entry(path: &Path) -> Parsed {
                     exec = Some(value.to_string());
                 }
             }
+            "Icon" => {
+                if icon.is_none() && !value.is_empty() {
+                    icon = Some(value.to_string());
+                }
+            }
             "Terminal" => terminal = value == "true",
             "NoDisplay" => nodisplay = value == "true",
             "Hidden" => hidden = value == "true",
-            // `OnlyShowIn`/`NotShowIn`/`Icon` are parsed (recognized keys)
-            // and ignored: entries show everywhere, like the bash version.
+            // `OnlyShowIn`/`NotShowIn` are parsed (recognized keys) and
+            // ignored: entries show everywhere, like the bash version.
             _ => {}
         }
     }
@@ -370,6 +457,7 @@ fn read_entry(path: &Path) -> Parsed {
         name,
         exec,
         terminal,
+        icon,
     }
 }
 
@@ -469,6 +557,57 @@ mod tests {
         std::fs::write(&path, "[Desktop Entry]\nName=Gone\nHidden=true\n").expect("write");
         assert_eq!(read_entry(&path), Parsed::Hidden);
         std::fs::remove_file(&path).expect("cleanup");
+    }
+
+    #[test]
+    fn find_app_resolves_display_names_ids_and_icon_hints() {
+        let dir = fixture_dir("find-app");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        std::fs::write(
+            dir.join("firefox.desktop"),
+            "[Desktop Entry]\nName=Firefox\nExec=firefox %U\nIcon=firefox\n",
+        )
+        .expect("write firefox");
+        std::fs::write(
+            dir.join("org.kde.drkonqi.coredump.gui.desktop"),
+            "[Desktop Entry]\nName=Crashed Processes Viewer\nExec=drkonqi-coredump-gui\nIcon=tools-report-bug\n",
+        )
+        .expect("write viewer");
+        // `NoDisplay` entries are never resolution candidates, even when the
+        // icon matches: they are skipped by design (the lookup shares the
+        // launch scan).
+        std::fs::write(
+            dir.join("org.kde.drkonqi.desktop"),
+            "[Desktop Entry]\nName=Dr Konqi\nExec=/usr/libexec/drkonqi\nIcon=tools-report-bug\nNoDisplay=true\n",
+        )
+        .expect("write hidden handler");
+        let dirs = vec![dir.clone()];
+
+        for name in ["firefox", "firefox.desktop", "Firefox"] {
+            let entry = find_app_in(&dirs, name, None).unwrap_or_else(|| panic!("resolves {name}"));
+            assert_eq!(entry.id, "firefox.desktop", "{name}");
+        }
+        // The name match wins over the icon hint.
+        let named = find_app_in(&dirs, "Firefox", Some("tools-report-bug")).expect("name first");
+        assert_eq!(named.id, "firefox.desktop");
+
+        // notifyrc display name, no executable and no desktop `Name`: only
+        // the icon hint links it to an entry.
+        let by_icon = find_app_in(&dirs, "Crash Reporting System", Some("tools-report-bug"))
+            .expect("icon hint match");
+        assert_eq!(by_icon.id, "org.kde.drkonqi.coredump.gui.desktop");
+        assert_eq!(by_icon.exec, "drkonqi-coredump-gui");
+
+        assert_eq!(find_app_in(&dirs, "Unknown App", None), None);
+        assert_eq!(
+            find_app_in(&dirs, "Crash Reporting System", Some("/tmp/icon.png")),
+            None,
+            "icon paths never match an Icon= name"
+        );
+        assert_eq!(find_app_in(&dirs, "", Some("tools-report-bug")), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Scratch dir for inline unit fixtures (integration fixtures live in

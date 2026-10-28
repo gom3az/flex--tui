@@ -320,8 +320,32 @@ fn notify_daemon_answers_dbus_when_bus_available() {
         eprintln!("e2e: Notify call failed, treating as skip: {stderr}");
         return;
     }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let id = stdout
+        .split("uint32 ")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse::<u32>().ok())
+        .expect("daemon must return a notification id");
+    assert!(id > 0, "daemon returned no usable id: {stdout:?}");
+
+    // Leave the user's notification center as we found it: the test's own
+    // entry must not become an unread row in the live feed.
+    let id_arg = id.to_string();
+    let closed = run(Command::new("gdbus").args([
+        "call",
+        "--session",
+        "--dest",
+        "org.freedesktop.Notifications",
+        "--object-path",
+        "/org/freedesktop/Notifications",
+        "--method",
+        "org.freedesktop.Notifications.CloseNotification",
+        id_arg.as_str(),
+    ]));
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("uint32"),
-        "daemon must return a notification id"
+        closed.status.success(),
+        "CloseNotification must succeed: {}",
+        String::from_utf8_lossy(&closed.stderr)
     );
 }

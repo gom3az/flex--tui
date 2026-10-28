@@ -42,8 +42,7 @@ fn store_reaches_the_ranked_view() {
     let tab = probe.app.active_tab().expect("proc has a tab");
     assert!(tab.filterable, "proc is the searchable vehicle");
     assert!(tab.rows.len() > 1, "need room to reorder");
-    let target = tab.rows.len() - 1;
-    let target_id = tab.rows[target].id.as_str().to_owned();
+    let target_id = tab.rows.last().expect("rows").id.as_str().to_owned();
 
     let now = usage::now_secs();
     let path = fixture("live", &format!("proc\t5.0\t{now}\t{target_id}\n"));
@@ -55,9 +54,18 @@ fn store_reaches_the_ranked_view() {
         !menu.app.usage.is_empty(),
         "table loads for the menu provider"
     );
+    // `proc` sorts by RSS, so the recorded row's index shifts between the
+    // probe build and this one; compare against its *current* index rather
+    // than the probe's.
+    let current = menu.app.active_tab().expect("proc has a tab");
+    let expected = current
+        .rows
+        .iter()
+        .position(|row| row.id.as_str() == target_id)
+        .expect("recorded row still listed");
     assert_eq!(
         first_visible_index(&menu),
-        target,
+        expected,
         "most-used on top at open"
     );
 

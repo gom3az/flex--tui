@@ -168,11 +168,15 @@ fn pkill_class(class: &str, path_env: &str) -> anyhow::Result<()> {
 ///
 /// This is the `</dev/null >/dev/null 2>&1 & disown` half of `popup.sh` —
 /// the child outlives the toggler and no pipe stays open. Like `popup.sh`
-/// this does not `setsid`: the popup is a plain detached child.
+/// the default keeps the child in the caller's process group. `session` puts
+/// it in a new session through `setsid -f` instead, for callers that run
+/// *inside* a pty: the notify drawer executes an action and exits, closing
+/// its kitty pty, and a same-group child would take the hangup `SIGHUP`
+/// before its window ever appeared.
 ///
-/// `# Errors`: when `argv` is empty, the terminal binary is missing from
-/// `path_env`, or the spawn itself fails.
-fn spawn_detached(argv: &[String], path_env: &str) -> anyhow::Result<()> {
+/// `# Errors`: when `argv` is empty, the terminal (or `setsid`, for
+/// `session`) binary is missing from `path_env`, or the spawn itself fails.
+fn spawn_detached(argv: &[String], path_env: &str, session: bool) -> anyhow::Result<()> {
     let Some((program, rest)) = argv.split_first() else {
         return Err(anyhow::anyhow!("popup: empty spawn argv"));
     };
@@ -186,6 +190,15 @@ fn spawn_detached(argv: &[String], path_env: &str) -> anyhow::Result<()> {
             }
         }
     };
+    if session {
+        let Some(setsid) = resolve_tool("setsid", path_env) else {
+            return Err(anyhow::anyhow!("popup: setsid not found on PATH"));
+        };
+        let trailing: Vec<&str> = rest.iter().map(String::as_str).collect();
+        crate::spawn::spawn_detached(&setsid, &bin, &trailing)
+            .context("popup: failed to spawn terminal")?;
+        return Ok(());
+    }
     let mut cmd = std::process::Command::new(&bin);
     cmd.args(rest)
         .stdin(std::process::Stdio::null())
@@ -202,12 +215,40 @@ fn spawn_detached(argv: &[String], path_env: &str) -> anyhow::Result<()> {
 ///
 /// `None` inherits the ambient `PATH`; `Some` shadows it, so spawn-path
 /// tests run stub `pgrep`/`pkill`/terminal scripts without touching the
-/// process env or any live tool.
-fn toggle_impl(
+/// process env or any live tool. Crate-visible so `exec::notify` can route
+/// its own notification labels to a sibling flex popup with the same
+/// toggle keying.
+pub(crate) fn toggle_impl(
     kind: TerminalKind,
     class: &str,
     cmd: &[String],
     path_override: Option<&str>,
+) -> anyhow::Result<()> {
+    toggle_inner(kind, class, cmd, path_override, false)
+}
+
+/// [`toggle_impl`] that puts the new popup in its own session (`setsid -f`).
+///
+/// For callers running inside a pty that is about to close: the notify drawer
+/// executes an "Open App" action and exits, and a popup left in its process
+/// group would be killed by the hangup `SIGHUP` before its window appears.
+pub(crate) fn toggle_detached(
+    kind: TerminalKind,
+    class: &str,
+    cmd: &[String],
+    path_override: Option<&str>,
+) -> anyhow::Result<()> {
+    toggle_inner(kind, class, cmd, path_override, true)
+}
+
+/// Shared toggle body; `session` selects the spawn mode (see
+/// [`spawn_detached`]).
+fn toggle_inner(
+    kind: TerminalKind,
+    class: &str,
+    cmd: &[String],
+    path_override: Option<&str>,
+    session: bool,
 ) -> anyhow::Result<()> {
     let path_env = match path_override {
         Some(path) => path.to_string(),
@@ -219,7 +260,7 @@ fn toggle_impl(
     if pgrep_open(class, &path_env)? {
         return pkill_class(class, &path_env);
     }
-    spawn_detached(&terminal::spawn_argv(kind, class, cmd), &path_env)
+    spawn_detached(&terminal::spawn_argv(kind, class, cmd), &path_env, session)
 }
 
 /// Toggle the popup for `variant_class`, running `cmd` when opening.
