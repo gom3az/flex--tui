@@ -121,6 +121,21 @@ fn retrying<T>(run: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
 
 /// Whether a popup of `class` is currently open (`pgrep -f "<class> "`).
 ///
+/// Shared with the toast host, which must not stack banners over the open
+/// notification center.
+#[must_use]
+pub fn class_is_open(class: &str) -> bool {
+    class_is_open_with(class, &ambient_path())
+}
+
+/// [`class_is_open`] with an explicit `PATH` (test seam).
+#[must_use]
+pub fn class_is_open_with(class: &str, path_env: &str) -> bool {
+    pgrep_open(class, path_env).unwrap_or(false)
+}
+
+/// Whether a popup of `class` is currently open (`pgrep -f "<class> "`).
+///
 /// `# Errors`: when `pgrep` is missing from `path_env` or cannot be
 /// executed. A non-zero exit (no match) is `Ok(false)`, not an error.
 fn pgrep_open(class: &str, path_env: &str) -> anyhow::Result<bool> {
@@ -255,7 +270,9 @@ fn toggle_inner(
         None => ambient_path(),
     };
     if class == DRAWER_CLASS {
-        let _ = pkill_class("flex-notify-toast", &path_env);
+        // The drawer supersedes the banner stack: close it and drop anything
+        // still queued, so a reopen cannot replay a stale toast.
+        crate::exec::toast::dismiss_all(&path_env);
     }
     if pgrep_open(class, &path_env)? {
         return pkill_class(class, &path_env);

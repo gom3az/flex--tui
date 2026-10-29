@@ -842,7 +842,7 @@ fn flex_dispatcher(path_env: &str) -> Option<PathBuf> {
 /// The drawer inherits its launcher's `PATH` — waybar's, which has no
 /// `~/.local/bin` — so bare names fail there. Prefer the sibling of the
 /// running binary (the whole farm is installed in one directory), then `PATH`.
-fn sibling_binary(name: &str, path_env: &str) -> Option<PathBuf> {
+pub(crate) fn sibling_binary(name: &str, path_env: &str) -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let sibling = dir.join(name);
@@ -1962,7 +1962,15 @@ impl NotificationServer {
                 .dnd
                 .is_active(now)
             {
-                spawn_transient_toast_with_path(&summary, &body, self.toast_path_env.as_deref());
+                // Nothing is stored for feedback, so the card carries its own
+                // text through the toast spool.
+                let mut item = NotificationItem::new(0, "flex-notify", summary, body, urgency);
+                item.timestamp = now;
+                crate::exec::toast::enqueue_transient(
+                    &item,
+                    self.state_path.as_deref(),
+                    self.toast_path_env.as_deref(),
+                );
             }
             return 0;
         }
@@ -2040,7 +2048,7 @@ impl NotificationServer {
 
         if !is_dnd && !is_app_muted && !suppress_sound {
             play_notification_sound_with(urgency, false, sound_name.as_deref(), None);
-            spawn_toast_with_path(
+            crate::exec::toast::enqueue_stored(
                 target_id,
                 self.state_path.as_deref(),
                 self.toast_path_env.as_deref(),
@@ -2098,338 +2106,17 @@ impl NotificationServer {
     ) -> zbus::Result<()>;
 }
 
-/// Format the header line of a notification toast card.
-/// Total target width: `target_right_col` display columns (excluding right margin).
-/// Left margin: 2 spaces. Icon width: 1 cell. Spacing: 2 spaces.
-/// App name & summary separated by " · ".
-/// Relative timestamp right-aligned to `target_right_col`.
-#[must_use]
-pub fn format_toast_header(
-    icon: &str,
-    app_name: &str,
-    summary: &str,
-    rel: &str,
-    target_right_col: usize,
-) -> String {
-    use unicode_width::UnicodeWidthStr as _;
-
-    let prefix = format!("  {icon}  ");
-    let prefix_width = prefix.width();
-    let rel_width = rel.width();
-    let sep = " · ";
-    let sep_width = sep.width();
-    let app_width = app_name.width();
-
-    let max_text_width = if target_right_col > prefix_width + rel_width + 1 {
-        target_right_col - prefix_width - rel_width - 1
-    } else {
-        10
-    };
-
-    let summary_avail = if max_text_width > app_width + sep_width {
-        max_text_width - app_width - sep_width
-    } else {
-        0
-    };
-
-    let truncated_summary = if summary_avail == 0 {
-        String::new()
-    } else if summary.width() > summary_avail {
-        let mut s = String::new();
-        let mut w = 0;
-        for c in summary.chars() {
-            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            if w + cw + 1 > summary_avail {
-                s.push('…');
-                break;
-            }
-            s.push(c);
-            w += cw;
-        }
-        s
-    } else {
-        summary.to_string()
-    };
-
-    let left_combined_width = if truncated_summary.is_empty() {
-        app_width
-    } else {
-        app_width + sep_width + truncated_summary.width()
-    };
-
-    let fill_spaces = if target_right_col > prefix_width + left_combined_width + rel_width {
-        target_right_col - prefix_width - left_combined_width - rel_width
-    } else {
-        1
-    };
-
-    let spaces_str = " ".repeat(fill_spaces);
-
-    if truncated_summary.is_empty() {
-        format!("{prefix}\x1b[1m{app_name}\x1b[0m{spaces_str}\x1b[2m{rel}\x1b[0m")
-    } else {
-        format!(
-            "{prefix}\x1b[1m{app_name}\x1b[0m · {truncated_summary}{spaces_str}\x1b[2m{rel}\x1b[0m"
-        )
-    }
-}
-
-/// Auto-dismiss delay used when a sender asked for the server default.
-pub const TOAST_DEFAULT_SECS: u64 = 4;
-/// Critical alerts stay on screen a little longer than ordinary toasts.
-pub const TOAST_CRITICAL_SECS: u64 = 7;
-/// Upper bound for a sender-requested toast lifetime: a banner must never
-/// pin itself to the screen for minutes because of a stray timeout.
-pub const TOAST_MAX_SECS: u64 = 30;
-
-/// Auto-dismiss delay for a toast card at `now`.
+/// Queue a toast for a stored notification.
 ///
-/// A positive `expire_timeout` is honored (clamped to 1..=[`TOAST_MAX_SECS`])
-/// relative to [`NotificationItem::expires_at`]; otherwise the server default
-/// applies.
-#[must_use]
-pub fn toast_timeout_secs(item: &NotificationItem, now: u64) -> u64 {
-    if let Some(at) = item.expires_at {
-        return at.saturating_sub(now).clamp(1, TOAST_MAX_SECS);
-    }
-    if item.urgency == Urgency::Critical {
-        TOAST_CRITICAL_SECS
-    } else {
-        TOAST_DEFAULT_SECS
-    }
-}
-
-/// Format a modern boxed Wiremix notification toast card with rounded borders.
-/// Total width: `width` columns (default 50).
-#[must_use]
-#[allow(
-    clippy::too_many_lines,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-pub fn format_toast_card(
-    item: &NotificationItem,
-    rel_time: &str,
-    width: usize,
-    _timeout_secs: u64,
-) -> String {
-    use unicode_width::UnicodeWidthStr as _;
-
-    let target_width = width.max(36);
-    let inner_width = target_width.saturating_sub(4); // 2 spaces padding + 2 border chars
-
-    let (border_ansi, icon, icon_ansi) = match item.urgency {
-        Urgency::Critical => ("\x1b[1;31m", "󰀦", "\x1b[1;31m"),
-        Urgency::Normal => ("\x1b[90m", "󰂚", "\x1b[37m"),
-        Urgency::Low => ("\x1b[2;37m", "󰂞", "\x1b[2;37m"),
-    };
-
-    let reset = "\x1b[0m";
-    let bold = "\x1b[1m";
-    let dim = "\x1b[2m";
-    let yellow_bold = "\x1b[1;33m";
-    let cyan = "\x1b[36m";
-
-    let left_width = 3 + 1 + 1 + item.app_name.width() + 1; // "╭─ " + icon(1) + " " + app + " "
-    let crit_badge = if item.urgency == Urgency::Critical {
-        " [CRITICAL]"
-    } else {
-        ""
-    };
-
-    let right_head_raw = format!("{crit_badge} {rel_time} ─╮");
-    let right_width = right_head_raw.width();
-
-    let fill_len = target_width.saturating_sub(left_width + right_width);
-    let fill_dashes = "─".repeat(fill_len);
-
-    let top_line = format!(
-        "{border_ansi}╭─ {reset}{icon_ansi}{icon}{reset} {bold}{}{reset} {border_ansi}{fill_dashes}{reset}{yellow_bold}{crit_badge}{reset} {dim}{rel_time}{reset} {border_ansi}─╮{reset}",
-        item.app_name
-    );
-
-    let make_content_row = |content_spans: &str, content_len: usize| -> String {
-        let pad_len = inner_width.saturating_sub(content_len);
-        let pad = " ".repeat(pad_len);
-        format!("{border_ansi}│{reset} {content_spans}{pad} {border_ansi}│{reset}")
-    };
-
-    let mut lines = Vec::new();
-    lines.push(top_line);
-
-    let summary_text = item.summary.replace('\n', " ");
-    let mut sum_truncated = String::new();
-    let mut sum_w = 0;
-    for c in summary_text.chars() {
-        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if sum_w + cw > inner_width {
-            break;
-        }
-        sum_truncated.push(c);
-        sum_w += cw;
-    }
-    let summary_formatted = format!("{bold}{sum_truncated}{reset}");
-    lines.push(make_content_row(&summary_formatted, sum_w));
-
-    if !item.body.is_empty() {
-        let body_clean = item.body.replace('\n', " ");
-        let mut body_truncated = String::new();
-        let mut body_w = 0;
-        for c in body_clean.chars() {
-            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            if body_w + cw + 1 > inner_width {
-                body_truncated.push('…');
-                body_w += 1;
-                break;
-            }
-            body_truncated.push(c);
-            body_w += cw;
-        }
-        let body_formatted = format!("{dim}{body_truncated}{reset}");
-        lines.push(make_content_row(&body_formatted, body_w));
-    }
-
-    if let Some(p) = item.progress {
-        let pct = (p.clamp(0.0, 1.0) * 100.0) as usize;
-        let bar_max = inner_width.saturating_sub(17);
-        let fill = (bar_max * pct) / 100;
-        let empty = bar_max.saturating_sub(fill);
-        let filled_bar = "█".repeat(fill);
-        let empty_bar = "░".repeat(empty);
-
-        let prog_str =
-            format!("Progress: [{cyan}{filled_bar}{reset}{dim}{empty_bar}{reset}] {pct:>3}%");
-        let raw_prog = format!("Progress: [{filled_bar}{empty_bar}] {pct:>3}%");
-        lines.push(make_content_row(&prog_str, raw_prog.width()));
-    }
-
-    if !item.actions.is_empty() {
-        let mut action_spans = format!("{bold}Actions:{reset}");
-        let mut raw_actions = String::from("Actions:");
-        let mut act_w = 8;
-        for (idx, action) in item.actions.iter().enumerate().take(3) {
-            let num = idx + 1;
-            let act_text = format!(" {yellow_bold}[{num}]{reset} {} ", action.title);
-            let raw_text = format!(" [{num}] {} ", action.title);
-            let act_len = raw_text.width();
-            if act_w + act_len > inner_width {
-                break;
-            }
-            action_spans.push_str(&act_text);
-            raw_actions.push_str(&raw_text);
-            act_w += act_len;
-        }
-        lines.push(make_content_row(&action_spans, raw_actions.width()));
-    }
-
-    let bot_dash = "─".repeat(target_width.saturating_sub(2));
-    lines.push(format!("{border_ansi}╰{bot_dash}╯{reset}"));
-
-    lines.join("\n")
-}
-
-/// Kitty flags shared by every toast window (stored and transient).
-const TOAST_KITTY_ARGS: &[&str] = &[
-    "--class",
-    "flex-notify-toast",
-    "-o",
-    "font_size=11",
-    "-o",
-    "remember_window_size=no",
-    "-o",
-    "initial_window_width=50c",
-    "-o",
-    "initial_window_height=6c",
-    "-o",
-    "window_padding_width=0",
-    "-o",
-    "window_padding_height=0",
-];
-
-/// The `kitty …` command prefix for a toast window.
-fn toast_kitty_cmd() -> String {
-    format!("kitty {}", TOAST_KITTY_ARGS.join(" "))
-}
-
-/// Spawn a transient toast overlay for a newly-arrived notification.
-///
-/// Launches `kitty --class flex-notify-toast -o font_size=11 -o remember_window_size=no
-/// -o initial_window_width=50c -o initial_window_height=6c -o window_padding_width=0 -o window_padding_height=0 -e flex-notify toast <id>` detached.
+/// Rendering lives in [`crate::exec::toast`]: one host window stacks every
+/// banner, so this only spools the event and makes sure the host is running.
 pub fn spawn_toast(id: u32, state_path: Option<&Path>) {
     spawn_toast_with_path(id, state_path, None);
 }
 
-/// [`spawn_toast`] with an explicit `PATH` override (test seam).
-///
-/// `None` inherits the ambient `PATH`; `Some` shadows it (including inside
-/// the `sh -c` body, via an exported `PATH`) so tests run stub `sh`/`kitty`
-/// scripts without touching the process env or opening windows.
+/// [`spawn_toast`] with an explicit `PATH` (test seam).
 pub fn spawn_toast_with_path(id: u32, state_path: Option<&Path>, path_override: Option<&str>) {
-    let state_arg =
-        state_path.map_or_else(String::new, |p| format!(" --state-file '{}'", p.display()));
-    let cmd = format!("{} -e flex-notify{state_arg} toast {id}", toast_kitty_cmd());
-    // Double-fork via `sh -c '… &'`: the grandchild is reparented to init so
-    // no daemon FDs (including the zbus socket) are inherited.
-    // Do NOT redirect kitty's stdio: kitty opens its own PTY for the child
-    // (`-e flex-notify toast <id>`), so stdin/stdout of that child are the
-    // PTY — not /dev/null.  Redirecting them here would break the ANSI render
-    // (stdout→null = blank window) and the keypress poll (stdin→null = stty
-    // fails + instant-exit for Normal or spin-forever for Critical).
-    let sh_bin = match path_override {
-        Some(path_env) => match crate::tools::resolve_tool("sh", path_env) {
-            Some(path) => path,
-            None => return,
-        },
-        None => PathBuf::from("sh"),
-    };
-    let mut toast = Command::new(&sh_bin);
-    toast
-        .args(["-c", &format!("{cmd} &")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Some(path_env) = path_override {
-        toast.env("PATH", path_env);
-    }
-    // Reaped on a waiter thread: the intermediate `sh` exits immediately and
-    // would otherwise linger as a zombie under the long-lived daemon.
-    let _ = crate::spawn::spawn_and_reap(&mut toast);
-}
-
-/// Spawn a toast card from text, without storing it.
-///
-/// [`spawn_toast`] renders a stored notification by id; feedback that must not
-/// be persisted (the freedesktop `transient` hint — e.g. flex's own
-/// "File not found") has no id to look up, so the text travels in argv and
-/// nothing is written to the state store.
-fn spawn_transient_toast_with_path(summary: &str, body: &str, path_override: Option<&str>) {
-    let ambient = std::env::var("PATH").unwrap_or_default();
-    let path_env = path_override.unwrap_or(&ambient);
-    let Some(bin) = sibling_binary("flex-notify", path_env) else {
-        return;
-    };
-    let sh_bin = match path_override {
-        Some(path_env) => match crate::tools::resolve_tool("sh", path_env) {
-            Some(path) => path,
-            None => return,
-        },
-        None => PathBuf::from("sh"),
-    };
-    // The text arrives as positional parameters, never spliced into the
-    // command string: a summary/body containing quotes, `$` or `;` must stay
-    // inert. Same `sh -c '… &'` double-fork as [`spawn_toast_with_path`], so
-    // the daemon's FDs are not inherited.
-    let script = format!("{} -e \"$0\" toast-text \"$1\" \"$2\" &", toast_kitty_cmd());
-    let mut toast = Command::new(&sh_bin);
-    toast
-        .args(["-c", &script, &bin.to_string_lossy(), summary, body])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Some(path_env) = path_override {
-        toast.env("PATH", path_env);
-    }
-    let _ = crate::spawn::spawn_and_reap(&mut toast);
+    crate::exec::toast::enqueue_stored(id, state_path, path_override);
 }
 
 /// Run the D-Bus Notification daemon.
@@ -2789,8 +2476,18 @@ mod tests {
         );
         let logged = read_log_soon(&kitty_log);
         assert!(
-            logged.contains("File not found") && logged.contains("/tmp/gone.png"),
-            "the toast still renders the payload: {logged:?}"
+            logged.contains("toasts"),
+            "the feedback banner opens a toast window: {logged:?}"
+        );
+        let spool = crate::exec::toast::spool_dir(Some(&path));
+        let event = std::fs::read_dir(&spool)
+            .ok()
+            .and_then(|mut entries| entries.find_map(std::result::Result::ok))
+            .expect("event file");
+        let payload = std::fs::read_to_string(event.path()).expect("read event");
+        assert!(
+            payload.contains("File not found") && payload.contains("/tmp/gone.png"),
+            "the toast still renders the payload: {payload:?}"
         );
         let _ = std::fs::remove_dir_all(&stubs);
     }
@@ -2980,26 +2677,6 @@ mod tests {
         assert_eq!(loaded.priority_apps.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn toast_timeout_follows_the_sender_deadline_within_bounds() {
-        let now = 100;
-        let mut item = NotificationItem::new(1, "App", "summary", "body", Urgency::Normal);
-        assert_eq!(toast_timeout_secs(&item, now), TOAST_DEFAULT_SECS);
-
-        item.urgency = Urgency::Critical;
-        assert_eq!(toast_timeout_secs(&item, now), TOAST_CRITICAL_SECS);
-
-        item.urgency = Urgency::Normal;
-        item.expires_at = Some(now + 2);
-        assert_eq!(toast_timeout_secs(&item, now), 2);
-        item.expires_at = Some(now + 999);
-        assert_eq!(toast_timeout_secs(&item, now), TOAST_MAX_SECS);
-        item.expires_at = Some(now);
-        assert_eq!(toast_timeout_secs(&item, now), 1);
-        item.expires_at = Some(now - 50);
-        assert_eq!(toast_timeout_secs(&item, now), 1);
     }
 
     #[test]
@@ -3457,7 +3134,10 @@ mod tests {
 
     /// Scratch dir with a logging `notify-send` stub, plus its log path.
     fn notifier_dir(name: &str) -> (PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("flex-notify-{name}-{}", std::process::id()));
+        static NOTIFIER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = NOTIFIER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("flex-notify-{name}-{}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let log = dir.join("notify.log");
@@ -3574,33 +3254,6 @@ mod tests {
                 "/tmp/gone.png"
             ],
             "the transient hint keeps feedback out of the feed and the badge"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn transient_toast_renders_from_argv_only() {
-        let (dir, log) = toast_dir("transient");
-        let path_env = dir.to_string_lossy().into_owned();
-        let body = "/tmp/gone; rm -rf $HOME";
-
-        spawn_transient_toast_with_path("File not found", body, Some(&path_env));
-
-        let logged = read_log_soon(&log);
-        let args: Vec<&str> = logged.lines().collect();
-        assert_eq!(args.first(), Some(&"--class"));
-        assert_eq!(args.get(1), Some(&"flex-notify-toast"));
-        // The card text is argv, not a state lookup, and the body arrives
-        // whole: shell metacharacters in a path stay inert.
-        assert_eq!(
-            &args[args.len() - 3..],
-            ["toast-text", "File not found", body],
-            "full argv: {args:?}"
-        );
-        let toast_bin = dir.join("flex-notify").to_string_lossy().into_owned();
-        assert!(
-            args.contains(&toast_bin.as_str()),
-            "the toast binary resolves by absolute path, not PATH lookup: {args:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -553,7 +553,7 @@ fn daemon_spawns_leave_no_zombies() {
     let dir = std::env::temp_dir().join(format!("flex-notify-reap-{}-{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch dir");
-    for name in ["pw-play", "kitty"] {
+    for name in ["pw-play", "kitty", "flex-notify"] {
         let stub = dir.join(name);
         std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("stub");
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -584,8 +584,14 @@ fn daemon_spawns_leave_no_zombies() {
         eprintln!("no freedesktop sound file; skipping sound leg");
     }
     // `kitty` is stubbed above, so no window opens; the intermediate `sh`
-    // still runs and must be reaped.
-    notify::spawn_toast_with_path(4242, None, Some(&stub_path));
+    // still runs and must be reaped. A temp state file keeps the spool beside
+    // it, so this never touches the live daemon's queue.
+    let item = NotificationItem::new(0, "reap", "reap", "", Urgency::Normal);
+    flex_rice::exec::toast::enqueue_transient(
+        &item,
+        Some(&dir.join("state.json")),
+        Some(&stub_path),
+    );
 
     for _ in 0..200 {
         if own_zombie_children() <= baseline {
@@ -639,19 +645,6 @@ fn notify_daemon_dbus_server_contract() {
 }
 
 #[test]
-fn toast_header_alignment_and_truncation() {
-    // Standard header formatting with 2-space left margin and right-aligned timestamp
-    let header = notify::format_toast_header("󰂚", "Discord", "#dev-team", "10s", 48);
-    assert!(header.starts_with("  󰂚  \x1b[1mDiscord\x1b[0m · #dev-team"));
-    assert!(header.ends_with("\x1b[2m10s\x1b[0m"));
-
-    let long_summary = "A".repeat(100);
-    let header_truncated = notify::format_toast_header("󰂚", "System", &long_summary, "2m", 48);
-    assert!(header_truncated.contains('…'));
-    assert!(header_truncated.ends_with("\x1b[2m2m\x1b[0m"));
-}
-
-#[test]
 fn entity_extractor_file_path_and_url_expansion() {
     let text = "Check file /tmp/build.log and visit www.github.com/gom3az/flex";
     let entities = notify::extract_entities(text);
@@ -664,8 +657,9 @@ fn entity_extractor_file_path_and_url_expansion() {
 }
 
 #[test]
-fn toast_boxed_card_rendering() {
+fn toast_card_is_a_lifetime_bar_without_fake_buttons() {
     use flex_rice::exec::notify::{NotificationAction, NotificationItem, Urgency};
+    use flex_rice::exec::toast;
     use unicode_width::UnicodeWidthStr as _;
 
     let mut item = NotificationItem::new(
@@ -687,15 +681,30 @@ fn toast_boxed_card_rendering() {
         },
     ];
 
-    let card = notify::format_toast_card(&item, "now", 50, 0);
+    let card = toast::format_card(&item, 2, 4, 50);
 
     assert!(card.contains("╭─"));
     assert!(card.contains("─╮"));
     assert!(card.contains("╰"));
     assert!(card.contains("╯"));
+    assert!(card.contains('󰀦'), "critical keeps its glyph");
+    assert!(
+        !card.contains("[CRITICAL]"),
+        "the badge duplicated the border colour"
+    );
+    assert!(
+        !card.contains("[1]") && !card.contains("[2]"),
+        "a non-focusable window must not advertise keypresses"
+    );
+    assert!(card.contains("notification center"));
+    assert!(card.contains("2s"), "the header counts down");
 
-    assert!(card.contains("󰀦"));
-    assert!(card.contains("[CRITICAL]"));
+    // Half the lifetime left: the bottom border is half filled.
+    let bottom = card.lines().last().expect("bottom border");
+    let filled = bottom.matches('━').count();
+    let empty = bottom.matches('─').count();
+    assert_eq!(filled, 24, "48 border cells at 2/4 remaining");
+    assert_eq!(empty, 24);
 
     let strip_ansi = |s: &str| -> String {
         let mut out = String::new();

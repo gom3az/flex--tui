@@ -20,6 +20,7 @@ pub mod record;
 pub mod shot;
 pub mod speedtest;
 pub mod theme;
+pub mod toast;
 pub mod wallpaper;
 pub mod wifi;
 

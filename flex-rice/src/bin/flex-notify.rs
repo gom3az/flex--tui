@@ -17,6 +17,7 @@ use clap::{Parser, Subcommand};
 use flex_core::backend::EXIT_CANCELLED;
 use flex_core::Outcome;
 use flex_rice::exec::notify::{self, DndState, Urgency};
+use flex_rice::exec::toast;
 use flex_rice::providers::notify as provider;
 use flex_rice::runner::{self, GlobalStyle, Provider};
 
@@ -110,17 +111,21 @@ enum NotifyOp {
     ClearAll,
     /// Toggle Do Not Disturb mode
     ToggleDnd,
-    /// Render a transient toast overlay for a notification and auto-dismiss
+    /// Show one notification through the shared toast host
     Toast {
         /// Notification ID to render
         id: u32,
     },
-    /// Render a transient toast for ad-hoc text (nothing is stored)
-    ToastText {
-        /// Card summary line
-        summary: String,
-        /// Card body line
-        body: String,
+    /// Run the shared toast host (one window, stacked cards)
+    Toasts {
+        /// Render one frame to stdout and exit (test seam)
+        #[arg(long)]
+        once: bool,
+    },
+    /// Run one slotted toast window
+    ToastSlot {
+        /// Slot index (0, 1, 2)
+        slot: usize,
     },
 }
 
@@ -128,54 +133,6 @@ fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-}
-
-/// Render a 2-line toast card and auto-dismiss after a timeout.
-///
-/// - Normal/Low: 5 s auto-dismiss; [SUPER+N] opens the notification center.
-/// - Critical:   stays until dismiss or timeout; [SUPER+N] opens the notification center.
-///
-/// The window is rendered directly to stdout without ratatui so the kitty
-/// instance stays tiny. Hyprland positions it via the `flex-notify-toast`
-/// window rule.
-fn run_toast(id: u32, state_path: Option<&std::path::Path>) {
-    let state = notify::load_state(state_path);
-    let Some(item) = state.notifications.iter().find(|n| n.id == id) else {
-        return;
-    };
-    render_toast(item);
-}
-
-/// Render a toast for text that is not in the store (`flex-notify toast-text`).
-///
-/// Used for flex's own feedback (e.g. "File not found"): it must be visible
-/// without becoming a feed entry, so it is rendered straight from the argv and
-/// never touches the notification state.
-fn run_toast_text(summary: &str, body: &str) {
-    let item = notify::NotificationItem::new(0, "flex-notify", summary, body, Urgency::Normal);
-    render_toast(&item);
-}
-
-fn render_toast(item: &notify::NotificationItem) {
-    use std::io::Write as _;
-
-    let now = now_secs();
-    let timeout_secs = notify::toast_timeout_secs(item, now);
-
-    let rel = notify::format_relative_time(item.timestamp, now);
-
-    let width = crossterm::terminal::size().map_or(50, |(cols, _)| (cols as usize).clamp(36, 120));
-
-    let card = notify::format_toast_card(item, &rel, width, timeout_secs);
-    for (idx, line) in card.lines().enumerate() {
-        print!("\x1b[{};1H{line}\x1b[K", idx + 1);
-    }
-    let _ = std::io::stdout().flush();
-
-    std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
-
-    print!("\x1b[?25h");
-    let _ = std::io::stdout().flush();
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -346,11 +303,15 @@ fn handle_op(op: NotifyOp, state_path: Option<&Path>) -> anyhow::Result<()> {
             Ok(())
         }
         NotifyOp::Toast { id } => {
-            run_toast(id, state_path);
+            toast::enqueue_stored(id, state_path, None);
             Ok(())
         }
-        NotifyOp::ToastText { summary, body } => {
-            run_toast_text(&summary, &body);
+        NotifyOp::Toasts { once } => {
+            toast::run_host(state_path, once);
+            Ok(())
+        }
+        NotifyOp::ToastSlot { slot } => {
+            toast::run_slot_host(state_path, slot);
             Ok(())
         }
     }
