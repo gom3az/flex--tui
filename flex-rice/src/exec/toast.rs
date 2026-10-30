@@ -11,6 +11,13 @@
 //! a `replaces_id` update or a dismissal in the center is reflected without a
 //! second copy of the content. Transient events (flex's own feedback) carry the
 //! item, because nothing is persisted for them.
+//!
+//! The window is fully transparent and each card paints its own opaque cell
+//! background, so banners stay readable over a wallpaper without a large dark
+//! rectangle around a one-card stack. Every cell is filled except a single
+//! quadrant in each corner cell: the corner block's missing quarter is the
+//! chamfer, which keeps the silhouette cut at 45° without leaving a notch that
+//! reads as a clipped card.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -54,6 +61,11 @@ const SPOOL_PRUNE_SECS: u64 = 600;
 /// `pkill -f` pattern for toast processes.
 const HOST_PATTERN: &str = "flex-notify.*toast";
 /// Kitty flags shared by the unified host window.
+///
+/// The window itself is fully transparent: the card paints its own fill, and
+/// kitty only applies `background_opacity` to cells whose background equals the
+/// default background. `background=#000000` pins that default so the card fill
+/// can never be mistaken for it (which would punch the card back out).
 const TOAST_KITTY_ARGS: &[&str] = &[
     "--class",
     "flex-notify-toast",
@@ -66,10 +78,29 @@ const TOAST_KITTY_ARGS: &[&str] = &[
     "-o",
     "initial_window_height=10c",
     "-o",
+    "background=#000000",
+    "-o",
     "background_opacity=0.0",
     "-o",
     "window_padding_width=0",
 ];
+
+/// Opaque fill painted behind every card cell.
+///
+/// Without it the card is only borders and glyphs, and a transparent window
+/// leaves the wallpaper visible *through* the card.
+const CARD_FILL: &str = "\x1b[48;2;24;24;37m"; // #181825
+/// Warmer fill for critical alerts, so urgency reads before the border colour.
+const CARD_FILL_CRITICAL: &str = "\x1b[48;2;43;26;34m"; // #2b1a22
+/// Restore the terminal default background.
+///
+/// Only the four corner cells use it: the missing quadrant of the corner block
+/// is the chamfer, so exactly one quarter of that cell shows the wallpaper.
+const BG_DEFAULT: &str = "\x1b[49m";
+/// Attribute reset shared by every styled span in a card row.
+const SGR_RESET: &str = "\x1b[0m";
+/// Dimmed secondary text (queue footer).
+const SGR_DIM: &str = "\x1b[2m";
 
 /// One spooled toast request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -627,6 +658,7 @@ pub fn render_stack(stack: &ToastStack, now: u64, width: usize, rows: usize) -> 
     let total = stack.visible().len();
     let mut hidden = stack.queued();
     let mut lines: Vec<String> = Vec::new();
+    let target_width = width.max(36);
 
     for (index, card) in stack.visible().iter().enumerate() {
         let remaining = card.shown_at.saturating_add(card.total).saturating_sub(now);
@@ -635,12 +667,18 @@ pub fn render_stack(stack: &ToastStack, now: u64, width: usize, rows: usize) -> 
             .map(str::to_string)
             .collect();
         let more_after = index + 1 < total || hidden > 0;
-        let needed = card_lines.len() + usize::from(more_after);
+        // One transparent row between cards keeps two filled cards from merging
+        // into a single block.
+        let gap = usize::from(!lines.is_empty());
+        let needed = card_lines.len() + usize::from(more_after) + gap;
         // The first card is always drawn (a too-short window clips its bottom
         // border); later ones only when they fit whole.
         if index > 0 && lines.len() + needed > rows {
             hidden += total - index;
             break;
+        }
+        if gap == 1 {
+            lines.push(String::new());
         }
 
         if lines.len() + card_lines.len() > rows {
@@ -653,7 +691,16 @@ pub fn render_stack(stack: &ToastStack, now: u64, width: usize, rows: usize) -> 
     }
 
     if hidden > 0 && lines.len() < rows {
-        lines.push(format!("  +{hidden} more"));
+        if !lines.is_empty() && lines.len() + 2 <= rows {
+            lines.push(String::new());
+        }
+        // The queue count rides the same fill so it reads as a card footer
+        // rather than as text floating on the wallpaper.
+        lines.push(paint_line(
+            &format!("{SGR_DIM}  +{hidden} more{SGR_RESET}"),
+            target_width,
+            CARD_FILL,
+        ));
     }
     lines.join("\n")
 }
@@ -686,6 +733,45 @@ fn clear_screen() {
     let _ = out.flush();
 }
 
+/// Display columns of `text`, ignoring the SGR sequences these rows use.
+fn visual_width(text: &str) -> usize {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut width = 0;
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Every escape here is a CSI ending in `m`; skip it whole.
+            for esc in chars.by_ref() {
+                if esc == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        width += UnicodeWidthChar::width(ch).unwrap_or(0);
+    }
+    width
+}
+
+/// Paint `fill` behind every cell of one rendered row and pad it to `width`.
+///
+/// The fill has to be re-applied after *every* `\x1b[0m`: a row is a sequence of
+/// independently styled spans, and a bare reset drops back to the default
+/// (transparent) background, which would stripe the wallpaper through the card.
+fn paint_line(line: &str, width: usize, fill: &str) -> String {
+    let resumed = format!("{SGR_RESET}{fill}");
+    let mut painted = String::with_capacity(line.len() + width * 2 + 32);
+    painted.push_str(fill);
+    painted.push_str(&line.replace(SGR_RESET, &resumed));
+    let used = visual_width(line);
+    if used < width {
+        painted.push_str(&" ".repeat(width - used));
+    }
+    painted.push_str(SGR_RESET);
+    painted
+}
+
 /// Format one toast card. Total width: `width` columns (minimum 36).
 ///
 /// The header carries the sender and the live countdown; the bottom border is
@@ -710,21 +796,32 @@ pub fn format_card(item: &NotificationItem, remaining: u64, total: u64, width: u
         Urgency::Low => ("\x1b[2;37m", "\x1b[2;37m", "󰂞", "\x1b[2;37m"),
     };
 
-    let reset = "\x1b[0m";
+    let reset = SGR_RESET;
     let bold = "\x1b[1m";
     let dim = "\x1b[2m";
+    let fill = match item.urgency {
+        Urgency::Critical => CARD_FILL_CRITICAL,
+        Urgency::Normal | Urgency::Low => CARD_FILL,
+    };
 
     let app = truncate_width(&item.app_name, target_width.saturating_sub(18));
-    // "╭─ " + icon + " " before the app name.
+    // "▟─ " + icon + " " before the app name.
     let left_width = 4 + icon.width() + app.width();
 
     let countdown = format!("{remaining}s");
-    let right_width = countdown.width() + 4; // "s ─╮"
+    let right_width = countdown.width() + 4; // "s ─▙"
     let fill_len = target_width.saturating_sub(left_width + right_width);
     let fill_dashes = "─".repeat(fill_len);
 
+    // Chamfered corners: each corner cell is a 3/4 block whose missing quadrant
+    // points outward, so the card silhouette is cut at 45° and the frame still
+    // runs unbroken through the block. Top-left loses its upper-left quadrant,
+    // top-right its upper-right, and so on.
+    let (top_left, top_right) = ("▟", "▙");
+    let (bottom_left, bottom_right) = ("▜", "▛");
+
     let top_line = format!(
-        "{border_ansi}╭─ {reset}{icon_ansi}{icon}{reset} {bold}{app}{reset} {border_ansi}{fill_dashes}{reset}{dim}{countdown}{reset} {border_ansi}─╮{reset}"
+        "{BG_DEFAULT}{border_ansi}{top_left}{fill}─ {reset}{icon_ansi}{icon}{reset} {bold}{app}{reset} {border_ansi}{fill_dashes}{reset}{dim}{countdown}{reset} {border_ansi}─{BG_DEFAULT}{border_ansi}{top_right}{reset}"
     );
 
     let make_content_row = |spans: &str, width_used: usize| -> String {
@@ -787,13 +884,17 @@ pub fn format_card(item: &NotificationItem, remaining: u64, total: u64, width: u
         .min(bar_width);
     let empty = bar_width.saturating_sub(filled);
     let bottom = format!(
-        "{border_ansi}╰{bar_ansi}{}{border_ansi}{}{reset}{border_ansi}╯{reset}",
+        "{BG_DEFAULT}{border_ansi}{bottom_left}{fill}{bar_ansi}{}{border_ansi}{}{BG_DEFAULT}{border_ansi}{bottom_right}{reset}",
         "━".repeat(filled),
         "─".repeat(empty)
     );
     lines.push(bottom);
 
-    lines.join("\n")
+    lines
+        .iter()
+        .map(|line| paint_line(line, target_width, fill))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Truncate to `max` display columns, marking the cut with `…`.
@@ -1004,6 +1105,140 @@ mod tests {
     }
 
     #[test]
+    fn toast_window_keeps_the_transparency_contract() {
+        // The window must stay see-through so only the painted card shows, and
+        // the default background must differ from CARD_FILL or kitty would
+        // treat the fill as "default" and make it transparent as well.
+        assert!(TOAST_KITTY_ARGS.contains(&"background_opacity=0.0"));
+        assert!(TOAST_KITTY_ARGS.contains(&"background=#000000"));
+        assert_ne!(CARD_FILL, CARD_FILL_CRITICAL);
+    }
+
+    #[test]
+    fn card_paints_an_opaque_fill_under_every_cell() {
+        use unicode_width::UnicodeWidthStr as _;
+
+        let mut item = sample(
+            1,
+            "Root partition capacity reached 98% and the card must stay readable",
+        );
+        item.actions = vec![crate::exec::notify::NotificationAction {
+            id: "clean".to_string(),
+            title: "Clean".to_string(),
+        }];
+        let card = format_card(&item, 2, 4, 50);
+
+        for line in card.lines() {
+            assert!(
+                line.starts_with(CARD_FILL),
+                "row does not open with the card fill: {line:?}"
+            );
+            assert_eq!(strip_ansi(line).width(), 50, "ragged row: {line:?}");
+            // Each span ends with a reset; the fill must come straight back or
+            // the wallpaper shows through the card. The final reset is the
+            // line terminator and needs no fill after it.
+            for (idx, _) in line.match_indices(SGR_RESET) {
+                let rest = &line[idx + SGR_RESET.len()..];
+                if rest.is_empty() {
+                    continue;
+                }
+                assert!(
+                    rest.starts_with(CARD_FILL),
+                    "unpainted reset leaves a hole: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn card_chamfers_its_corners_with_quadrant_blocks() {
+        let card = format_card(&sample(1, "body"), 4, 4, 50);
+        let plain = strip_ansi(&card);
+        let mut lines = plain.lines();
+        let top = lines.next().expect("top border");
+        let bottom = plain.lines().last().expect("bottom border");
+
+        // The corner block is 3/4 of a cell, so exactly one quadrant of each
+        // corner cell restores the default (transparent) background.
+        assert!(top.starts_with("▟─ "), "{top:?}");
+        assert!(top.ends_with("─▙"), "{top:?}");
+        assert!(bottom.starts_with('▜'), "{bottom:?}");
+        assert!(bottom.ends_with('▛'), "{bottom:?}");
+
+        for line in card.lines() {
+            assert!(
+                line.starts_with(CARD_FILL),
+                "row opens on the fill: {line:?}"
+            );
+        }
+        // Only the four corner cells go transparent; a fifth one would be a hole.
+        assert_eq!(
+            card.matches(BG_DEFAULT).count(),
+            4,
+            "the chamfer is one transparent quadrant per corner"
+        );
+        assert!(
+            !plain.contains('╭')
+                && !plain.contains('╮')
+                && !plain.contains('╰')
+                && !plain.contains('╯'),
+            "rounded corners are gone"
+        );
+    }
+
+    #[test]
+    fn critical_cards_use_a_warmer_fill() {
+        let mut item = sample(1, "boom");
+        item.urgency = Urgency::Critical;
+        let card = format_card(&item, 4, 4, 50);
+        assert!(card
+            .lines()
+            .all(|line| line.starts_with(CARD_FILL_CRITICAL)));
+        assert!(
+            !card.contains(CARD_FILL),
+            "critical cards must not use the neutral fill"
+        );
+    }
+
+    #[test]
+    fn stacked_cards_are_separated_by_a_transparent_row() {
+        let mut stack = ToastStack::default();
+        stack.push(CardKey::Stored(1), sample(1, "First"), 4, 10);
+        stack.push(CardKey::Stored(2), sample(2, "Second"), 4, 10);
+
+        let rendered = render_stack(&stack, 10, 50, 10);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 9, "two 4-row cards plus one gap row");
+        assert!(
+            lines[4].is_empty(),
+            "gap row is transparent: {:?}",
+            lines[4]
+        );
+        assert!(lines[3].contains('▛'));
+        assert!(lines[5].contains('▟'));
+    }
+
+    #[test]
+    fn queued_footer_is_filled_and_padded() {
+        use unicode_width::UnicodeWidthStr as _;
+
+        let mut stack = ToastStack::default();
+        for id in 1..=5 {
+            stack.push(CardKey::Stored(id), sample(id, ""), 4, 10);
+        }
+        assert_eq!(stack.queued(), 2);
+
+        let rendered = render_stack(&stack, 10, 50, 10);
+        let footer = rendered
+            .lines()
+            .find(|line| line.contains("more"))
+            .expect("queue footer");
+        assert!(footer.starts_with(CARD_FILL), "footer rides the fill");
+        assert_eq!(strip_ansi(footer).width(), 50, "footer is padded");
+        assert_eq!(strip_ansi(footer).trim_end(), "  +3 more");
+    }
+
+    #[test]
     fn card_wraps_the_body_to_two_lines_and_counts_down() {
         let item = sample(
             1,
@@ -1160,18 +1395,19 @@ mod tests {
         // At full height (50 rows), all 3 cards render without queue indicator.
         let full = render_stack(&stack, 10, 50, 50);
         assert!(!full.contains('+'), "no queue indicator when all fit");
-        let card_count = full.matches("╭─").count();
+        let card_count = strip_ansi(&full).matches("▟─").count();
         assert_eq!(card_count, 3);
 
-        // Limited to 6 rows: first card takes 4 lines, second card would need 4+1 > 2 remaining,
-        // so only 1 card renders and "+2 more" is shown on line 5.
+        // Limited to 6 rows: the first card takes 4 lines, second card would
+        // need a gap row + 4 lines > 2 remaining, so only 1 card renders and
+        // "+2 more" is shown below it.
         let clipped = render_stack(&stack, 10, 50, 6);
-        assert_eq!(clipped.matches("╭─").count(), 1);
-        assert!(clipped.contains("+2 more"));
+        assert_eq!(strip_ansi(&clipped).matches("▟─").count(), 1);
+        assert!(strip_ansi(&clipped).contains("+2 more"));
 
         // Limited to 4 rows: exactly 1 card fits, queue indicator omitted to prevent overflow.
         let exact = render_stack(&stack, 10, 50, 4);
-        assert_eq!(exact.matches("╭─").count(), 1);
+        assert_eq!(strip_ansi(&exact).matches("▟─").count(), 1);
         assert!(!exact.contains("+2 more"));
     }
 
@@ -1240,12 +1476,9 @@ mod tests {
         stack.push(CardKey::Stored(2), sample(2, "Second item body"), 4, 10);
 
         let rendered = render_stack(&stack, 10, 50, 10);
-        assert_eq!(rendered.matches("╭─").count(), 2, "both top borders render");
-        assert_eq!(
-            rendered.matches('╰').count(),
-            2,
-            "both bottom borders render"
-        );
+        let plain = strip_ansi(&rendered);
+        assert_eq!(plain.matches("▟─").count(), 2, "both top borders render");
+        assert_eq!(plain.matches('▜').count(), 2, "both bottom borders render");
         assert!(rendered.contains("First item body"));
         assert!(rendered.contains("Second item body"));
     }
@@ -1271,7 +1504,7 @@ mod tests {
         assert_eq!(stack.visible()[0].key, CardKey::Stored(2));
 
         let rendered = render_stack(&stack, 12, 50, 10);
-        assert_eq!(rendered.matches("╭─").count(), 1);
+        assert_eq!(strip_ansi(&rendered).matches("▟─").count(), 1);
         assert!(rendered.contains("Second notification"));
     }
 

@@ -683,29 +683,6 @@ fn toast_card_is_a_lifetime_bar_without_fake_buttons() {
 
     let card = toast::format_card(&item, 2, 4, 50);
 
-    assert!(card.contains("╭─"));
-    assert!(card.contains("─╮"));
-    assert!(card.contains("╰"));
-    assert!(card.contains("╯"));
-    assert!(card.contains('󰀦'), "critical keeps its glyph");
-    assert!(
-        !card.contains("[CRITICAL]"),
-        "the badge duplicated the border colour"
-    );
-    assert!(
-        !card.contains("[1]") && !card.contains("[2]"),
-        "a non-focusable window must not advertise keypresses"
-    );
-    assert!(card.contains("notification center"));
-    assert!(card.contains("2s"), "the header counts down");
-
-    // Half the lifetime left: the bottom border is half filled.
-    let bottom = card.lines().last().expect("bottom border");
-    let filled = bottom.matches('━').count();
-    let empty = bottom.matches('─').count();
-    assert_eq!(filled, 24, "48 border cells at 2/4 remaining");
-    assert_eq!(empty, 24);
-
     let strip_ansi = |s: &str| -> String {
         let mut out = String::new();
         let mut in_esc = false;
@@ -722,6 +699,32 @@ fn toast_card_is_a_lifetime_bar_without_fake_buttons() {
         }
         out
     };
+    // The card paints a cell background around the corner glyphs, so structure
+    // assertions read the stripped text.
+    let plain = strip_ansi(&card);
+
+    assert!(plain.contains("▟─"));
+    assert!(plain.contains("─▙"));
+    assert!(plain.contains("▜"));
+    assert!(plain.contains("▛"));
+    assert!(plain.contains('󰀦'), "critical keeps its glyph");
+    assert!(
+        !plain.contains("[CRITICAL]"),
+        "the badge duplicated the border colour"
+    );
+    assert!(
+        !plain.contains("[1]") && !plain.contains("[2]"),
+        "a non-focusable window must not advertise keypresses"
+    );
+    assert!(plain.contains("notification center"));
+    assert!(plain.contains("2s"), "the header counts down");
+
+    // Half the lifetime left: the bottom border is half filled.
+    let bottom = card.lines().last().expect("bottom border");
+    let filled = bottom.matches('━').count();
+    let empty = bottom.matches('─').count();
+    assert_eq!(filled, 24, "48 border cells at 2/4 remaining");
+    assert_eq!(empty, 24);
 
     for (idx, line) in card.lines().enumerate() {
         let clean = strip_ansi(line);
