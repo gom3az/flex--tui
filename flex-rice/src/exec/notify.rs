@@ -1044,16 +1044,14 @@ fn open_application_seeded(
 /// its field-code stripping and `Terminal=true` handling. `path_env` is the
 /// stub-`PATH` seam (`setsid` is resolved there).
 fn launch_desktop_entry(entry: &launch::DesktopEntry, path_env: &str) -> bool {
-    let stripped = launch::strip_field_codes(&entry.exec);
-    let mut tokens = stripped.split_whitespace().map(str::to_string);
-    let Some(program) = tokens.next() else {
+    let Some(cmd) = launch::DesktopCommand::parse(&entry.exec) else {
         return false;
     };
-    let args: Vec<String> = tokens.collect();
     // Read `$TERMINAL` only for `Terminal=true` entries, like the launch
     // executor does (a plain GUI launch must never consult it).
     let terminal = entry.terminal.then(crate::terminal::detect);
-    crate::exec::launch::execute_with(&entry.id, &program, &args, terminal, Some(path_env)).is_ok()
+    crate::exec::launch::execute_with(&entry.id, &cmd.program, &cmd.args, terminal, Some(path_env))
+        .is_ok()
 }
 
 /// Query `hyprctl clients -j` and hand the parsed client list to `visit`.

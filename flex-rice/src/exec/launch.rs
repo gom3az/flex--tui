@@ -26,11 +26,10 @@
 //!   [`resolve_id`](crate::providers::launch::resolve_id) the library
 //!   exposes, so the resolution semantics are identical with one fewer
 //!   spawn.
-//! - No shell word-splitting: the wrapper `eval`s the stripped `Exec` line
-//!   (so shell quotes in `Exec` group arguments); the port splits the line
-//!   on whitespace and spawns directly (the pilot's generated-script removal
-//!   made the same trade). Plain `prog --flag` lines — the reference-data
-//!   case — are byte-identical; quoted `Exec` lines would group differently.
+//! - Desktop Entry specification quoting: the stripped `Exec` line is
+//!   parsed via [`launch::parse_exec`](crate::providers::launch::parse_exec)
+//!   which properly unquotes double-quoted tokens (such as quoted program
+//!   paths or arguments) and handles backslash escapes before direct spawn.
 //! - Exit-code normalisation: the wrapper `eval`s the `setsid` line so its
 //!   exit status propagates verbatim; the port maps every failure through
 //!   the shared runner, so any tool failure exits `1` with the single
@@ -239,23 +238,13 @@ pub fn execute(action_id: &str, path_env: Option<&str>) -> Result<ExecuteReport>
         }
         anyhow::bail!("launch: {desk_id} not found");
     };
-    let stripped = launch::strip_field_codes(&exec_raw);
-    if stripped.is_empty() {
-        anyhow::bail!("launch: empty Exec in {desk_id}");
-    }
-    let mut tokens = stripped.split_whitespace().map(str::to_string);
-    let Some(program) = tokens.next() else {
+    let Some(cmd) = launch::DesktopCommand::parse(&exec_raw) else {
         anyhow::bail!("launch: empty Exec in {desk_id}");
     };
-    let args: Vec<String> = tokens.collect();
     // Read `$TERMINAL` only for `Terminal=true` entries: a plain GUI launch
     // must never consult it (and so never warns about a bogus value).
-    let terminal = if terminal {
-        Some(terminal::detect())
-    } else {
-        None
-    };
-    execute_with(&desk_id, &program, &args, terminal, path_env)
+    let terminal = terminal.then(terminal::detect);
+    execute_with(&desk_id, &cmd.program, &cmd.args, terminal, path_env)
 }
 
 /// Whether any application directory currently holds `desk_id` (tells the

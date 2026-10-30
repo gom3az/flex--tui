@@ -947,3 +947,36 @@ fn binary_outside_a_popup_reexecs_into_the_menu_wide_popup() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn executor_quoted_exec_path_unquotes_properly() {
+    let _env = EXEC_ENV_LOCK.lock().expect("env lock");
+    let dir = scratch("exec-quoted");
+    std::fs::create_dir_all(&dir).expect("stub dir");
+    install_setsid(&dir);
+    let home = scratch("exec-home-quoted");
+    let apps = home.join(".local/share/applications");
+    std::fs::create_dir_all(&apps).expect("apps dir");
+    std::fs::write(
+        apps.join("android-studio.desktop"),
+        "[Desktop Entry]\nName=Android Studio\nExec=\"/opt/android-studio/bin/studio\" %f\nTerminal=false\n",
+    )
+    .expect("android studio entry");
+    let _home = set_exec_env("HOME", &home);
+    let path_env = exec_stub_path(&dir);
+    let id = launch::entry_id("android-studio.desktop");
+    let report = flex_rice::exec::launch::execute(&id, Some(&path_env)).expect("launch succeeds");
+    assert_eq!(report.desktop_id.as_deref(), Some("android-studio.desktop"));
+    assert_eq!(
+        report.program.as_deref(),
+        Some("/opt/android-studio/bin/studio")
+    );
+    let log = read_setsid_log(&dir);
+    assert_eq!(
+        log.trim(),
+        "setsid -f /opt/android-studio/bin/studio",
+        "quoted Exec program is unquoted before setsid invocation"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&home);
+}

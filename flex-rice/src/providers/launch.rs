@@ -320,6 +320,19 @@ pub fn find_app_in(dirs: &[PathBuf], name: &str, icon: Option<&str>) -> Option<D
         .cloned()
 }
 
+const QUOTE_CHAR: char = '"';
+const ESCAPE_CHAR: char = '\\';
+const FIELD_CODE_PREFIX: u8 = b'%';
+const SPACE_BYTE: u8 = b' ';
+
+const KEY_NAME: &str = "Name";
+const KEY_EXEC: &str = "Exec";
+const KEY_ICON: &str = "Icon";
+const KEY_TERMINAL: &str = "Terminal";
+const KEY_NO_DISPLAY: &str = "NoDisplay";
+const KEY_HIDDEN: &str = "Hidden";
+const VALUE_TRUE: &str = "true";
+
 /// Strip `.desktop` field codes (` %U`, ` %F`, …) and surrounding spaces.
 ///
 /// The regex is `sed -E 's/ %[A-Za-z]//g; s/^ *//; s/ *$//'`.
@@ -332,17 +345,17 @@ pub fn strip_field_codes(exec: &str) -> String {
     let mut out = String::with_capacity(exec.len());
     let mut index = 0_usize;
     while index < bytes.len() {
-        let is_code = bytes[index] == b' '
-            && bytes.get(index + 1) == Some(&b'%')
+        let is_code = bytes[index] == SPACE_BYTE
+            && bytes.get(index + 1) == Some(&FIELD_CODE_PREFIX)
             && bytes.get(index + 2).is_some_and(u8::is_ascii_alphabetic);
         if is_code {
             index += 3;
-        } else {
-            // ASCII fast path; multibyte sequences are pushed as whole chars.
-            let c = exec[index..].chars().next().unwrap_or(' ');
-            out.push(c);
-            index += c.len_utf8();
+            continue;
         }
+        // ASCII fast path; multibyte sequences are pushed as whole chars.
+        let c = exec[index..].chars().next().unwrap_or(' ');
+        out.push(c);
+        index += c.len_utf8();
     }
     // Trim without a second alloc when already trimmed.
     let trimmed = out.trim_matches(' ');
@@ -350,6 +363,143 @@ pub fn strip_field_codes(exec: &str) -> String {
         out
     } else {
         trimmed.to_string()
+    }
+}
+
+/// State of the `FreeDesktop` Exec line tokenizer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TokenizerState {
+    #[default]
+    Unquoted,
+    InQuotes,
+    EscapedUnquoted,
+    EscapedInQuotes,
+}
+
+#[derive(Debug, Default)]
+struct TokenAccumulator {
+    buffer: String,
+    active: bool,
+}
+
+impl TokenAccumulator {
+    fn mark_active(&mut self) {
+        self.active = true;
+    }
+
+    fn push_char(&mut self, c: char) {
+        self.buffer.push(c);
+        self.active = true;
+    }
+
+    fn flush(&mut self, target: &mut Vec<String>) {
+        if !self.active {
+            return;
+        }
+        target.push(std::mem::take(&mut self.buffer));
+        self.active = false;
+    }
+}
+
+/// `FreeDesktop` Exec command line tokenizer.
+#[derive(Debug, Default)]
+pub struct ExecTokenizer {
+    state: TokenizerState,
+    accumulator: TokenAccumulator,
+    tokens: Vec<String>,
+}
+
+impl ExecTokenizer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn tokenize(mut self, input: &str) -> Vec<String> {
+        for ch in input.chars() {
+            self.step(ch);
+        }
+        self.finalize();
+        self.tokens
+    }
+
+    fn step(&mut self, ch: char) {
+        match (self.state, ch) {
+            (TokenizerState::Unquoted, ESCAPE_CHAR) => {
+                self.state = TokenizerState::EscapedUnquoted;
+                self.accumulator.mark_active();
+            }
+            (TokenizerState::InQuotes, ESCAPE_CHAR) => {
+                self.state = TokenizerState::EscapedInQuotes;
+                self.accumulator.mark_active();
+            }
+            (TokenizerState::Unquoted, QUOTE_CHAR) => {
+                self.state = TokenizerState::InQuotes;
+                self.accumulator.mark_active();
+            }
+            (TokenizerState::InQuotes, QUOTE_CHAR) => {
+                self.state = TokenizerState::Unquoted;
+                self.accumulator.mark_active();
+            }
+            (TokenizerState::EscapedUnquoted, c) => {
+                self.accumulator.push_char(c);
+                self.state = TokenizerState::Unquoted;
+            }
+            (TokenizerState::EscapedInQuotes, c) => {
+                self.accumulator.push_char(c);
+                self.state = TokenizerState::InQuotes;
+            }
+            (TokenizerState::Unquoted, c) if c.is_whitespace() => {
+                self.accumulator.flush(&mut self.tokens);
+            }
+            (TokenizerState::Unquoted | TokenizerState::InQuotes, c) => {
+                self.accumulator.push_char(c);
+            }
+        }
+    }
+
+    fn finalize(&mut self) {
+        match self.state {
+            TokenizerState::EscapedUnquoted | TokenizerState::EscapedInQuotes => {
+                self.accumulator.push_char(ESCAPE_CHAR);
+            }
+            TokenizerState::Unquoted | TokenizerState::InQuotes => {}
+        }
+        self.accumulator.flush(&mut self.tokens);
+    }
+}
+
+/// Parse an `Exec` command line into tokens according to the `FreeDesktop`
+/// Desktop Entry Specification.
+///
+/// Handles double-quoted tokens, backslash escaping, and whitespace separation.
+#[must_use]
+pub fn parse_exec(exec: &str) -> Vec<String> {
+    ExecTokenizer::default().tokenize(exec)
+}
+
+/// A parsed desktop command representing an executable program and its arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl DesktopCommand {
+    /// Parse an `Exec` command line according to the `FreeDesktop` Desktop Entry Specification.
+    ///
+    /// Field codes (`%f`, `%U`, etc.) are stripped first, then the remaining tokens
+    /// are parsed handling quotes, whitespace, and escape sequences.
+    ///
+    /// Returns `None` if the resulting command is empty or has a blank executable program.
+    #[must_use]
+    pub fn parse(raw_exec: &str) -> Option<Self> {
+        let stripped = strip_field_codes(raw_exec);
+        let mut tokens = parse_exec(&stripped).into_iter();
+        let program = tokens.next().filter(|p| !p.is_empty())?;
+        let args = tokens.collect();
+        Some(Self { program, args })
     }
 }
 
@@ -394,6 +544,81 @@ enum Parsed {
     Malformed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopKey {
+    Name,
+    Exec,
+    Icon,
+    Terminal,
+    NoDisplay,
+    Hidden,
+    Other,
+}
+
+impl DesktopKey {
+    fn parse(key: &str) -> Self {
+        match key {
+            KEY_NAME => Self::Name,
+            KEY_EXEC => Self::Exec,
+            KEY_ICON => Self::Icon,
+            KEY_TERMINAL => Self::Terminal,
+            KEY_NO_DISPLAY => Self::NoDisplay,
+            KEY_HIDDEN => Self::Hidden,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Default)]
+struct EntryBuilder {
+    name: Option<String>,
+    exec: Option<String>,
+    icon: Option<String>,
+    terminal: bool,
+    nodisplay: bool,
+    hidden: bool,
+}
+
+impl EntryBuilder {
+    fn apply_field(&mut self, key: DesktopKey, value: &str) {
+        match key {
+            DesktopKey::Name => {
+                self.name.get_or_insert_with(|| value.to_string());
+            }
+            DesktopKey::Exec => {
+                self.exec.get_or_insert_with(|| value.to_string());
+            }
+            DesktopKey::Icon => {
+                if !value.is_empty() {
+                    self.icon.get_or_insert_with(|| value.to_string());
+                }
+            }
+            DesktopKey::Terminal => self.terminal = value == VALUE_TRUE,
+            DesktopKey::NoDisplay => self.nodisplay = value == VALUE_TRUE,
+            DesktopKey::Hidden => self.hidden = value == VALUE_TRUE,
+            DesktopKey::Other => {}
+        }
+    }
+
+    fn build(self) -> Parsed {
+        if self.nodisplay || self.hidden {
+            return Parsed::Hidden;
+        }
+        let Some(name) = self.name.filter(|v| !v.is_empty()) else {
+            return Parsed::Malformed;
+        };
+        let Some(exec) = self.exec.filter(|v| !v.is_empty()) else {
+            return Parsed::Malformed;
+        };
+        Parsed::Entry {
+            name,
+            exec,
+            terminal: self.terminal,
+            icon: self.icon,
+        }
+    }
+}
+
 /// Parse one `.desktop` file into a [`Parsed`] outcome.
 ///
 /// Whole-file key scan (like the bash `grep -E` prefilter, not section
@@ -405,60 +630,15 @@ fn read_entry(path: &Path) -> Parsed {
         return Parsed::Malformed;
     };
     let text = String::from_utf8_lossy(&bytes);
-    let mut name: Option<String> = None;
-    let mut exec: Option<String> = None;
-    let mut icon: Option<String> = None;
-    let mut terminal = false;
-    let mut nodisplay = false;
-    let mut hidden = false;
+    let mut builder = EntryBuilder::default();
     for line in text.lines() {
         let line = line.strip_suffix('\r').unwrap_or(line);
-        let Some((key, value)) = line.split_once('=') else {
+        let Some((raw_key, value)) = line.split_once('=') else {
             continue;
         };
-        match key {
-            "Name" => {
-                if name.is_none() {
-                    name = Some(value.to_string());
-                }
-            }
-            "Exec" => {
-                if exec.is_none() {
-                    exec = Some(value.to_string());
-                }
-            }
-            "Icon" => {
-                if icon.is_none() && !value.is_empty() {
-                    icon = Some(value.to_string());
-                }
-            }
-            "Terminal" => terminal = value == "true",
-            "NoDisplay" => nodisplay = value == "true",
-            "Hidden" => hidden = value == "true",
-            // `OnlyShowIn`/`NotShowIn` are parsed (recognized keys) and
-            // ignored: entries show everywhere, like the bash version.
-            _ => {}
-        }
+        builder.apply_field(DesktopKey::parse(raw_key), value);
     }
-    // Checked before the field check: `NoDisplay`/`Hidden` means "never
-    // show this", so such a file is skipped by design even when its body is
-    // also incomplete — reporting it as malformed would be the same false
-    // positive as reporting it at all.
-    if nodisplay || hidden {
-        return Parsed::Hidden;
-    }
-    let (Some(name), Some(exec)) = (
-        name.filter(|value| !value.is_empty()),
-        exec.filter(|value| !value.is_empty()),
-    ) else {
-        return Parsed::Malformed;
-    };
-    Parsed::Entry {
-        name,
-        exec,
-        terminal,
-        icon,
-    }
+    builder.build()
 }
 
 /// Bash-cache sort line: `name\texec-stripped\tterm`.
@@ -485,6 +665,34 @@ mod tests {
         ] {
             assert_eq!(strip_field_codes(raw), stripped, "strip {raw:?}");
         }
+    }
+
+    #[test]
+    fn parse_exec_handles_quotes_escapes_and_whitespace() {
+        assert_eq!(parse_exec(""), Vec::<String>::new());
+        assert_eq!(parse_exec("   "), Vec::<String>::new());
+        assert_eq!(parse_exec("firefox"), vec!["firefox"]);
+        assert_eq!(parse_exec("firefox %U"), vec!["firefox", "%U"]);
+        assert_eq!(
+            parse_exec("\"/opt/android-studio/bin/studio\""),
+            vec!["/opt/android-studio/bin/studio"]
+        );
+        assert_eq!(
+            parse_exec("\"/opt/android-studio/bin/studio\" %f"),
+            vec!["/opt/android-studio/bin/studio", "%f"]
+        );
+        assert_eq!(
+            parse_exec("myapp --title \"Hello World\" --flag"),
+            vec!["myapp", "--title", "Hello World", "--flag"]
+        );
+        assert_eq!(
+            parse_exec("\"/path with spaces/bin\" \"arg\\\"with\\\"quote\""),
+            vec!["/path with spaces/bin", "arg\"with\"quote"]
+        );
+        assert_eq!(
+            parse_exec("--opt=\"val with spaces\""),
+            vec!["--opt=val with spaces"]
+        );
     }
 
     #[test]
