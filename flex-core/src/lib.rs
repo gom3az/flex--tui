@@ -20,7 +20,7 @@ pub mod theme;
 pub mod width;
 
 pub use charset::{CharSet, CharSetName};
-pub use theme::{Theme, ThemeName};
+pub use theme::{ColorRole, ColorScheme, Theme, ThemeName};
 
 use std::cell::{Ref, RefCell};
 use std::collections::BTreeSet;

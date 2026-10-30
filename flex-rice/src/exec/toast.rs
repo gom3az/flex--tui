@@ -17,8 +17,11 @@
 //! rectangle around a one-card stack. Every cell is filled except a single
 //! quadrant in each corner cell: the corner block's missing quarter is the
 //! chamfer, which keeps the silhouette cut at 45° without leaving a notch that
-//! reads as a clipped card.
+//! reads as a clipped card. The block itself is painted in the card fill rather
+//! than the border colour, so the thin `─`/`│` frame is the only visible stroke:
+//! the corner reads as an open 45° cut rather than a heavy solid square.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
@@ -29,9 +32,12 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flex_core::diag;
+use flex_core::theme::ColorScheme;
+use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 
 use super::notify::{self, NotificationItem, NotifyState, Urgency};
+use crate::palette::Palette;
 
 /// Auto-dismiss delay used when a sender asked for the server default.
 pub const TOAST_DEFAULT_SECS: u64 = 4;
@@ -92,6 +98,15 @@ const TOAST_KITTY_ARGS: &[&str] = &[
 const CARD_FILL: &str = "\x1b[48;2;24;24;37m"; // #181825
 /// Warmer fill for critical alerts, so urgency reads before the border colour.
 const CARD_FILL_CRITICAL: &str = "\x1b[48;2;43;26;34m"; // #2b1a22
+/// Foreground twin of [`CARD_FILL`].
+///
+/// The corner blocks are painted with this instead of the border colour: a
+/// solid 3/4 block in border ink is far heavier than the 1-cell line stroke, so
+/// painting it in the card fill makes it vanish into the body and leaves only
+/// the thin frame visible.
+const CARD_INK: &str = "\x1b[38;2;24;24;37m"; // #181825
+/// Foreground twin of [`CARD_FILL_CRITICAL`].
+const CARD_INK_CRITICAL: &str = "\x1b[38;2;43;26;34m"; // #2b1a22
 /// Restore the terminal default background.
 ///
 /// Only the four corner cells use it: the missing quadrant of the corner block
@@ -662,10 +677,11 @@ pub fn render_stack(stack: &ToastStack, now: u64, width: usize, rows: usize) -> 
 
     for (index, card) in stack.visible().iter().enumerate() {
         let remaining = card.shown_at.saturating_add(card.total).saturating_sub(now);
-        let mut card_lines: Vec<String> = format_card(&card.item, remaining, card.total, width)
-            .lines()
-            .map(str::to_string)
-            .collect();
+        let mut card_lines: Vec<String> =
+            format_card_with(&card.item, remaining, card.total, width, active_palette())
+                .lines()
+                .map(str::to_string)
+                .collect();
         let more_after = index + 1 < total || hidden > 0;
         // One transparent row between cards keeps two filled cards from merging
         // into a single block.
@@ -699,7 +715,7 @@ pub fn render_stack(stack: &ToastStack, now: u64, width: usize, rows: usize) -> 
         lines.push(paint_line(
             &format!("{SGR_DIM}  +{hidden} more{SGR_RESET}"),
             target_width,
-            CARD_FILL,
+            active_palette().normal.fill.as_ref(),
         ));
     }
     lines.join("\n")
@@ -772,11 +788,180 @@ fn paint_line(line: &str, width: usize, fill: &str) -> String {
     painted
 }
 
+/// SGR colors for one urgency class of toast card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToastColors {
+    /// Opaque background painted behind every card cell.
+    pub fill: Cow<'static, str>,
+    /// Foreground twin of `fill` (the chamfered corner blocks).
+    pub ink: Cow<'static, str>,
+    /// Frame, countdown and the `─` runs.
+    pub border: Cow<'static, str>,
+    /// Urgency icon.
+    pub icon: Cow<'static, str>,
+    /// Progress bar fill and the bottom lifetime bar.
+    pub bar: Cow<'static, str>,
+}
+
+/// Card colors for every urgency class.
+///
+/// [`ToastPalette::ansi`] reproduces the historical hardcoded look (used when
+/// no theme palette is readable); [`ToastPalette::from_palette`] derives the
+/// same structure from the active theme's Material 3 [`ColorScheme`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToastPalette {
+    /// Normal urgency.
+    pub normal: ToastColors,
+    /// Low urgency (dimmer chrome in the ANSI look).
+    pub low: ToastColors,
+    /// Critical urgency.
+    pub critical: ToastColors,
+}
+
+impl ToastPalette {
+    /// Today's ANSI look, byte-for-byte.
+    #[must_use]
+    pub fn ansi() -> Self {
+        let normal = ToastColors {
+            fill: Cow::Borrowed(CARD_FILL),
+            ink: Cow::Borrowed(CARD_INK),
+            border: Cow::Borrowed("\x1b[90m"),
+            icon: Cow::Borrowed("\x1b[37m"),
+            bar: Cow::Borrowed("\x1b[37m"),
+        };
+        Self {
+            low: ToastColors {
+                fill: Cow::Borrowed(CARD_FILL),
+                ink: Cow::Borrowed(CARD_INK),
+                border: Cow::Borrowed("\x1b[2;37m"),
+                icon: Cow::Borrowed("\x1b[2;37m"),
+                bar: Cow::Borrowed("\x1b[2;37m"),
+            },
+            critical: ToastColors {
+                fill: Cow::Borrowed(CARD_FILL_CRITICAL),
+                ink: Cow::Borrowed(CARD_INK_CRITICAL),
+                border: Cow::Borrowed("\x1b[1;31m"),
+                icon: Cow::Borrowed("\x1b[1;31m"),
+                bar: Cow::Borrowed("\x1b[1;31m"),
+            },
+            normal,
+        }
+    }
+
+    /// Derive card colors from the active theme palette via Material 3 [`ColorScheme`].
+    #[must_use]
+    pub fn from_palette(palette: &Palette) -> Self {
+        palette
+            .color_scheme()
+            .map_or_else(Self::ansi, |scheme| Self::from_color_scheme(&scheme))
+    }
+
+    /// Derive card colors from a Material 3 [`ColorScheme`].
+    ///
+    /// Normal cards sit on `SurfaceContainer` with an `Outline` frame and a `Tertiary`
+    /// bar; critical cards keep the error urgency signal on a fill that is
+    /// `Surface` tinted 22% toward `Error`.
+    #[must_use]
+    pub fn from_color_scheme(scheme: &ColorScheme) -> Self {
+        let normal_fill = bg_sgr(scheme.surface_container);
+        let normal_ink = fg_sgr(scheme.surface_container);
+        let critical_blend = blend(scheme.surface, scheme.error, 22);
+        let critical_fill = bg_sgr(critical_blend);
+        let critical_ink = fg_sgr(critical_blend);
+        Self {
+            normal: ToastColors {
+                fill: Cow::Owned(normal_fill),
+                ink: Cow::Owned(normal_ink),
+                border: Cow::Owned(fg_sgr(scheme.outline)),
+                icon: Cow::Owned(fg_sgr(scheme.primary)),
+                bar: Cow::Owned(fg_sgr(scheme.tertiary)),
+            },
+            low: ToastColors {
+                fill: Cow::Owned(bg_sgr(scheme.surface_container)),
+                ink: Cow::Owned(fg_sgr(scheme.surface_container)),
+                border: Cow::Owned(format!("\x1b[2m{}", fg_sgr(scheme.outline_variant))),
+                icon: Cow::Owned(format!("\x1b[2m{}", fg_sgr(scheme.on_surface_variant))),
+                bar: Cow::Owned(format!("\x1b[2m{}", fg_sgr(scheme.outline_variant))),
+            },
+            critical: ToastColors {
+                fill: Cow::Owned(critical_fill),
+                ink: Cow::Owned(critical_ink),
+                border: Cow::Owned(fg_sgr(scheme.error)),
+                icon: Cow::Owned(fg_sgr(scheme.error)),
+                bar: Cow::Owned(fg_sgr(scheme.error)),
+            },
+        }
+    }
+
+    /// Colors for one urgency class.
+    #[must_use]
+    pub fn for_urgency(&self, urgency: Urgency) -> &ToastColors {
+        match urgency {
+            Urgency::Critical => &self.critical,
+            Urgency::Low => &self.low,
+            Urgency::Normal => &self.normal,
+        }
+    }
+}
+
+/// Truecolor foreground SGR for `color` (falls back to white).
+fn fg_sgr(color: Color) -> String {
+    match color {
+        Color::Rgb(r, g, b) => format!("\x1b[38;2;{r};{g};{b}m"),
+        _ => "\x1b[37m".to_string(),
+    }
+}
+
+/// Truecolor background SGR for `color` (falls back to no fill).
+fn bg_sgr(color: Color) -> String {
+    match color {
+        Color::Rgb(r, g, b) => format!("\x1b[48;2;{r};{g};{b}m"),
+        _ => "\x1b[49m".to_string(),
+    }
+}
+
+/// Mix `percent`% of `over` into `base`, channel by channel.
+fn blend(base: Color, over: Color, percent: u16) -> Color {
+    let (Color::Rgb(br, bg, bb), Color::Rgb(or, og, ob)) = (base, over) else {
+        return over;
+    };
+    let mix = |b: u8, o: u8| -> u8 {
+        let b = i32::from(b);
+        let o = i32::from(o);
+        let out = (b + (o - b) * i32::from(percent) / 100).clamp(0, 255);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let out = out as u8;
+        out
+    };
+    Color::Rgb(mix(br, or), mix(bg, og), mix(bb, ob))
+}
+
+/// Card colors for the active theme, resolved once per process.
+fn active_palette() -> &'static ToastPalette {
+    static PALETTE: OnceLock<ToastPalette> = OnceLock::new();
+    PALETTE.get_or_init(|| {
+        crate::palette::active().map_or_else(ToastPalette::ansi, ToastPalette::from_palette)
+    })
+}
+
 /// Format one toast card. Total width: `width` columns (minimum 36).
 ///
 /// The header carries the sender and the live countdown; the bottom border is
 /// the lifetime bar. Actions are not rendered as buttons — the window never
 /// takes focus, so a `[1]` label would advertise a keypress that cannot arrive.
+#[must_use]
+pub fn format_card(item: &NotificationItem, remaining: u64, total: u64, width: usize) -> String {
+    static ANSI: OnceLock<ToastPalette> = OnceLock::new();
+    format_card_with(
+        item,
+        remaining,
+        total,
+        width,
+        ANSI.get_or_init(ToastPalette::ansi),
+    )
+}
+
+/// [`format_card`] with explicit card colors.
 #[must_use]
 #[allow(
     clippy::too_many_lines,
@@ -784,25 +969,31 @@ fn paint_line(line: &str, width: usize, fill: &str) -> String {
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-pub fn format_card(item: &NotificationItem, remaining: u64, total: u64, width: usize) -> String {
+pub fn format_card_with(
+    item: &NotificationItem,
+    remaining: u64,
+    total: u64,
+    width: usize,
+    colors: &ToastPalette,
+) -> String {
     use unicode_width::UnicodeWidthStr as _;
 
     let target_width = width.max(36);
     let inner_width = target_width.saturating_sub(4);
 
-    let (border_ansi, bar_ansi, icon, icon_ansi) = match item.urgency {
-        Urgency::Critical => ("\x1b[1;31m", "\x1b[1;31m", "󰀦", "\x1b[1;31m"),
-        Urgency::Normal => ("\x1b[90m", "\x1b[37m", "󰂚", "\x1b[37m"),
-        Urgency::Low => ("\x1b[2;37m", "\x1b[2;37m", "󰂞", "\x1b[2;37m"),
+    let icon = match item.urgency {
+        Urgency::Critical => "󰀦",
+        Urgency::Normal => "󰂚",
+        Urgency::Low => "󰂞",
     };
+    let card = colors.for_urgency(item.urgency);
+    let (border_ansi, bar_ansi, icon_ansi) =
+        (card.border.as_ref(), card.bar.as_ref(), card.icon.as_ref());
 
     let reset = SGR_RESET;
     let bold = "\x1b[1m";
     let dim = "\x1b[2m";
-    let fill = match item.urgency {
-        Urgency::Critical => CARD_FILL_CRITICAL,
-        Urgency::Normal | Urgency::Low => CARD_FILL,
-    };
+    let (fill, ink) = (card.fill.as_ref(), card.ink.as_ref());
 
     let app = truncate_width(&item.app_name, target_width.saturating_sub(18));
     // "▟─ " + icon + " " before the app name.
@@ -814,14 +1005,16 @@ pub fn format_card(item: &NotificationItem, remaining: u64, total: u64, width: u
     let fill_dashes = "─".repeat(fill_len);
 
     // Chamfered corners: each corner cell is a 3/4 block whose missing quadrant
-    // points outward, so the card silhouette is cut at 45° and the frame still
-    // runs unbroken through the block. Top-left loses its upper-left quadrant,
-    // top-right its upper-right, and so on.
+    // points outward, so the card silhouette is cut at 45°. Top-left loses its
+    // upper-left quadrant, top-right its upper-right, and so on. The block is
+    // painted in the card ink, not the border colour, so the thin frame is the
+    // only visible stroke; it stops at the cut instead of turning through a
+    // heavy solid corner.
     let (top_left, top_right) = ("▟", "▙");
     let (bottom_left, bottom_right) = ("▜", "▛");
 
     let top_line = format!(
-        "{BG_DEFAULT}{border_ansi}{top_left}{fill}─ {reset}{icon_ansi}{icon}{reset} {bold}{app}{reset} {border_ansi}{fill_dashes}{reset}{dim}{countdown}{reset} {border_ansi}─{BG_DEFAULT}{border_ansi}{top_right}{reset}"
+        "{BG_DEFAULT}{ink}{top_left}{fill}{border_ansi}─ {reset}{icon_ansi}{icon}{reset} {bold}{app}{reset} {border_ansi}{fill_dashes}{reset}{dim}{countdown}{reset} {border_ansi}─{BG_DEFAULT}{ink}{top_right}{reset}"
     );
 
     let make_content_row = |spans: &str, width_used: usize| -> String {
@@ -884,7 +1077,7 @@ pub fn format_card(item: &NotificationItem, remaining: u64, total: u64, width: u
         .min(bar_width);
     let empty = bar_width.saturating_sub(filled);
     let bottom = format!(
-        "{BG_DEFAULT}{border_ansi}{bottom_left}{fill}{bar_ansi}{}{border_ansi}{}{BG_DEFAULT}{border_ansi}{bottom_right}{reset}",
+        "{BG_DEFAULT}{ink}{bottom_left}{fill}{bar_ansi}{}{border_ansi}{}{BG_DEFAULT}{ink}{bottom_right}{reset}",
         "━".repeat(filled),
         "─".repeat(empty)
     );
@@ -1177,6 +1370,25 @@ mod tests {
             4,
             "the chamfer is one transparent quadrant per corner"
         );
+        // The block itself is painted in the card ink, so it blends into the
+        // body instead of outweighing the thin line stroke.
+        for glyph in ['▟', '▙', '▜', '▛'] {
+            let marker = format!("{BG_DEFAULT}{CARD_INK}{glyph}");
+            assert!(
+                card.contains(&marker),
+                "corner {glyph:?} is not painted in the card ink: {card:?}"
+            );
+        }
+        let mut critical = sample(1, "body");
+        critical.urgency = Urgency::Critical;
+        let critical = format_card(&critical, 4, 4, 50);
+        for glyph in ['▟', '▙', '▜', '▛'] {
+            let marker = format!("{BG_DEFAULT}{CARD_INK_CRITICAL}{glyph}");
+            assert!(
+                critical.contains(&marker),
+                "critical corner {glyph:?} is not painted in the critical ink"
+            );
+        }
         assert!(
             !plain.contains('╭')
                 && !plain.contains('╮')
@@ -1233,7 +1445,10 @@ mod tests {
             .lines()
             .find(|line| line.contains("more"))
             .expect("queue footer");
-        assert!(footer.starts_with(CARD_FILL), "footer rides the fill");
+        assert!(
+            footer.starts_with(active_palette().normal.fill.as_ref()),
+            "footer rides the fill"
+        );
         assert_eq!(strip_ansi(footer).width(), 50, "footer is padded");
         assert_eq!(strip_ansi(footer).trim_end(), "  +3 more");
     }
@@ -1533,6 +1748,56 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toast_palette_from_color_scheme_produces_foreground_ink_and_valid_chamfers() {
+        let scheme = ColorScheme {
+            primary: Color::Rgb(192, 76, 255),
+            on_primary: Color::Rgb(10, 10, 20),
+            secondary: Color::Rgb(43, 255, 136),
+            on_secondary: Color::Rgb(10, 10, 20),
+            tertiary: Color::Rgb(92, 124, 255),
+            on_tertiary: Color::Rgb(10, 10, 20),
+            surface: Color::Rgb(10, 10, 20),
+            surface_container: Color::Rgb(20, 20, 31),
+            on_surface: Color::Rgb(230, 230, 255),
+            on_surface_variant: Color::Rgb(85, 85, 122),
+            outline: Color::Rgb(61, 61, 92),
+            outline_variant: Color::Rgb(30, 30, 48),
+            error: Color::Rgb(255, 46, 110),
+            on_error: Color::Rgb(10, 10, 20),
+        };
+        let palette = ToastPalette::from_color_scheme(&scheme);
+
+        // Fill must use background SGR (\x1b[48;2;...m)
+        assert_eq!(palette.normal.fill, "\x1b[48;2;20;20;31m");
+        assert_eq!(palette.low.fill, "\x1b[48;2;20;20;31m");
+        assert!(palette.critical.fill.starts_with("\x1b[48;2;"));
+
+        // Ink MUST use foreground SGR (\x1b[38;2;...m), matching the fill's RGB
+        assert_eq!(palette.normal.ink, "\x1b[38;2;20;20;31m");
+        assert_eq!(palette.low.ink, "\x1b[38;2;20;20;31m");
+        assert!(palette.critical.ink.starts_with("\x1b[38;2;"));
+
+        // Verify Material 3 semantic roles
+        assert_eq!(palette.normal.border, "\x1b[38;2;61;61;92m");
+        assert_eq!(palette.normal.icon, "\x1b[38;2;192;76;255m"); // Primary accent for icon
+        assert_eq!(palette.normal.bar, "\x1b[38;2;92;124;255m"); // Tertiary for lifetime bar
+        assert_eq!(palette.critical.border, "\x1b[38;2;255;46;110m");
+        assert_eq!(palette.critical.icon, "\x1b[38;2;255;46;110m");
+        assert_eq!(palette.critical.bar, "\x1b[38;2;255;46;110m");
+
+        // Format a card and verify chamfer corners use ink foreground on transparent background
+        let item = sample(1, "Themed notification body");
+        let card = format_card_with(&item, 2, 4, 50, &palette);
+        for glyph in ['▟', '▙', '▜', '▛'] {
+            let marker = format!("{BG_DEFAULT}{}{glyph}", palette.normal.ink);
+            assert!(
+                card.contains(&marker),
+                "corner glyph {glyph:?} does not use foreground ink: {card:?}"
+            );
+        }
     }
 
     fn strip_ansi(input: &str) -> String {

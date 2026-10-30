@@ -342,12 +342,27 @@ impl StyleOptions {
     /// Apply the flags to a menu.
     #[must_use]
     pub fn apply(self, mut menu: Menu) -> Menu {
+        self.apply_with(&mut menu, crate::palette::active());
+        menu
+    }
+
+    /// [`StyleOptions::apply`] with an explicit theme palette.
+    ///
+    /// `palette` is only consulted for `-t default`: `nocolor`/`plain` are
+    /// explicit requests for a colorless menu.
+    pub fn apply_with(self, menu: &mut Menu, palette: Option<&crate::palette::Palette>) {
         menu.app.filter_mode = self.filter_mode;
         menu.app.use_frecency = self.frecency;
         menu.char_set = CharSet::get(self.char_set);
         menu.theme = Theme::get(self.theme);
+        // `-t default` follows the rice's active theme. `nocolor`/`plain` are
+        // explicit requests for a colorless menu and never consult it.
+        if self.theme == ThemeName::Default {
+            if let Some(palette) = palette {
+                menu.theme = palette.theme();
+            }
+        }
         menu.peaks = self.peaks;
-        menu
     }
 }
 
@@ -908,6 +923,41 @@ mod tests {
             ..style()
         };
         assert!(!disabled.apply(menu).app.use_frecency);
+    }
+
+    #[test]
+    fn style_apply_with_uses_explicit_palette_for_default_theme() {
+        use flex_core::{Row, RowId, Tab};
+        let sample = r##"{
+            "colors": {
+                "base": "#0a0a14", "text": "#e6e6ff",
+                "mauve": "#c04cff", "blue": "#5c7cff",
+                "green": "#2bff88", "red": "#ff2e6e",
+                "surface0": "#14141f", "surface1": "#1e1e30",
+                "overlay0": "#3d3d5c", "overlay1": "#55557a"
+            }
+        }"##;
+        let palette = crate::palette::Palette::from_json(sample).expect("valid palette");
+        let mut menu = crate::providers::menu(
+            "launch",
+            vec![Tab::with_rows("apps", vec![Row::new(RowId::new("a"), "A")])],
+        );
+        style().apply_with(&mut menu, Some(&palette));
+        assert_eq!(
+            menu.theme.selector.fg,
+            Some(palette.color_scheme().unwrap().primary)
+        );
+
+        let plain_style = StyleOptions {
+            theme: ThemeName::Plain,
+            ..style()
+        };
+        let mut plain_menu = crate::providers::menu(
+            "launch",
+            vec![Tab::with_rows("apps", vec![Row::new(RowId::new("a"), "A")])],
+        );
+        plain_style.apply_with(&mut plain_menu, Some(&palette));
+        assert_eq!(plain_menu.theme.selector.fg, None);
     }
 
     #[test]

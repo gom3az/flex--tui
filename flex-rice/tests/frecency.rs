@@ -42,7 +42,19 @@ fn store_reaches_the_ranked_view() {
     let tab = probe.app.active_tab().expect("proc has a tab");
     assert!(tab.filterable, "proc is the searchable vehicle");
     assert!(tab.rows.len() > 1, "need room to reorder");
-    let target_id = tab.rows.last().expect("rows").id.as_str().to_owned();
+    // Pick a stable existing process (preferring init PID 1 if not at index 0)
+    // rather than the very last row, which may be an ephemeral test worker that
+    // terminates before the menu rebuild.
+    let target_id = tab
+        .rows
+        .iter()
+        .skip(1)
+        .find(|r| r.id.as_str() == "1")
+        .or_else(|| tab.rows.get(1))
+        .expect("rows")
+        .id
+        .as_str()
+        .to_owned();
 
     let now = usage::now_secs();
     let path = fixture("live", &format!("proc\t5.0\t{now}\t{target_id}\n"));

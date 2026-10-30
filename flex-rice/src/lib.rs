@@ -13,6 +13,7 @@
 
 pub mod command;
 pub mod exec;
+pub mod palette;
 pub mod popup;
 pub mod providers;
 pub mod runner;

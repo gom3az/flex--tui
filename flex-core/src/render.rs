@@ -1018,38 +1018,33 @@ fn draw_header(
 
     // Right column, borrowed from the memos (what the old `target_line`
     // rendered, without rebuilding or measuring it).
-    if bare && !has_active_meta {
+    let target_rendered = if bare && !has_active_meta {
         // Bare rows with no active meta draw no right column.
+        true
     } else if !row.hide_target_in_header {
         if let (Some(target), Some(guard)) = (row.current_target(), target_guard.as_ref()) {
-            if target.is_default {
+            let line = if target.is_default {
                 Line::from(vec![
                     Span::styled(char_set.default_stream, theme.default_stream),
                     Span::from(" "),
                     Span::styled(guard.sanitized.as_str(), theme.node_target),
                 ])
-                .alignment(Alignment::Right)
-                .render(target_area, buf);
             } else {
                 Line::from(Span::styled(guard.sanitized.as_str(), theme.node_target))
-                    .alignment(Alignment::Right)
-                    .render(target_area, buf);
-            }
-        } else if texts.meta.src.is_some() {
-            Line::from(Span::styled(
-                texts.meta.sanitized.as_str(),
-                theme.node_target,
-            ))
+            };
+            line.alignment(Alignment::Right).render(target_area, buf);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if !target_rendered && texts.meta.src.is_some() {
+        meta_line(texts.meta.sanitized.as_str(), theme)
             .alignment(Alignment::Right)
             .render(target_area, buf);
-        }
-    } else if texts.meta.src.is_some() {
-        Line::from(Span::styled(
-            texts.meta.sanitized.as_str(),
-            theme.node_target,
-        ))
-        .alignment(Alignment::Right)
-        .render(target_area, buf);
     }
     if let Some(ellipses_area) = ellipses_area {
         Span::styled(TITLE_ELLIPSES, theme.node_title).render(ellipses_area, buf);
@@ -1400,6 +1395,56 @@ fn help_measured() -> &'static [width::Measured] {
     MEASURED.get_or_init(|| HELP_LINES.iter().map(|line| width::measure(line)).collect())
 }
 
+/// Filled cell of a text gauge baked into `Row::meta` (wifi/proc/net/bt).
+const META_GAUGE_FILLED: char = '█';
+/// Empty cell of a text gauge baked into `Row::meta`.
+const META_GAUGE_EMPTY: char = '░';
+
+/// Render a `Row::meta` string, styling any embedded text gauge.
+///
+/// Providers that report quantitative state on a compact row build a *text*
+/// gauge into the meta string (`87% [███████░]  WPA2  Connected`). The string
+/// is one `Row::meta`, so without this split the whole gauge would inherit
+/// `node_target` and a themed menu would still show a monochrome bar. Runs of
+/// [`META_GAUGE_FILLED`] take [`Theme::gauge_fill`] and runs of
+/// [`META_GAUGE_EMPTY`] take [`Theme::gauge_empty`]; every other run keeps
+/// `theme.node_target`.
+///
+/// The glyphs are single-column, so widths, truncation and right-alignment are
+/// unchanged by the split — only the colors differ. Meta strings with no gauge
+/// glyph (the common case) stay a single borrowed span.
+fn meta_line<'a>(text: &'a str, theme: &Theme) -> Line<'a> {
+    if !text.contains(META_GAUGE_FILLED) && !text.contains(META_GAUGE_EMPTY) {
+        return Line::from(Span::styled(text, theme.node_target));
+    }
+
+    let style_for = |ch: char| match ch {
+        META_GAUGE_FILLED => theme.gauge_fill,
+        META_GAUGE_EMPTY => theme.gauge_empty,
+        _ => theme.node_target,
+    };
+
+    let mut spans: Vec<Span<'a>> = Vec::with_capacity(4);
+    let mut run_start = 0_usize;
+    let mut current_style = match text.chars().next() {
+        Some(ch) => style_for(ch),
+        None => return Line::default(),
+    };
+
+    for (idx, ch) in text.char_indices() {
+        let style = style_for(ch);
+        if style != current_style {
+            spans.push(Span::styled(&text[run_start..idx], current_style));
+            current_style = style;
+            run_start = idx;
+        }
+    }
+    if run_start < text.len() {
+        spans.push(Span::styled(&text[run_start..], current_style));
+    }
+    Line::from(spans)
+}
+
 /// Help overlay (upstream geometry `app.rs:811-840`, chrome `help.rs:46-53`):
 /// centered inside the list area, `sum(widths) × min(rows + 2, 90%)`, `Clear`
 /// behind it, `help_border` block (no title upstream), and `•••` on the
@@ -1709,6 +1754,78 @@ pub fn row_layout(meta: Option<&str>, bare: bool, width_cells: usize) -> (usize,
         .saturating_sub(meta_w)
         .saturating_sub(1);
     (meta_w, avail)
+}
+
+#[cfg(test)]
+mod meta_gauge {
+    //! `meta_line` styles the text gauge baked into `Row::meta` (wifi, proc,
+    //! net, bt) without changing a single column of the string.
+
+    use super::*;
+    use ratatui::style::Color;
+
+    const FILL: Color = Color::Rgb(92, 124, 255);
+    const TROUGH: Color = Color::Rgb(61, 61, 92);
+
+    fn themed() -> Theme {
+        let mut theme = Theme::DEFAULT;
+        theme.gauge_fill = Style::new().fg(FILL);
+        theme.gauge_empty = Style::new().fg(TROUGH);
+        theme
+    }
+
+    fn parts(line: &Line<'_>) -> Vec<(String, Option<Color>)> {
+        line.spans
+            .iter()
+            .map(|span| (span.content.to_string(), span.style.fg))
+            .collect()
+    }
+
+    #[test]
+    fn meta_without_a_gauge_stays_one_span() {
+        let theme = themed();
+        let line = meta_line("WPA2  Connected", &theme);
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].style, theme.node_target);
+    }
+
+    #[test]
+    fn gauge_runs_take_the_gauge_tokens() {
+        let theme = themed();
+        let line = meta_line("87% [███░░]  WPA2", &theme);
+        assert_eq!(
+            parts(&line),
+            vec![
+                ("87% [".to_string(), None),
+                ("███".to_string(), Some(FILL)),
+                ("░░".to_string(), Some(TROUGH)),
+                ("]  WPA2".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_preserves_every_column() {
+        let theme = themed();
+        for text in [
+            "12.3% [█░░░░░░░]   1.2G test",
+            "100% [████████]  WPA2  Connected",
+            "0% [░░░░░░░░]  Open",
+            "██░",
+            "░█",
+        ] {
+            let line = meta_line(text, &theme);
+            let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(joined, text);
+        }
+    }
+
+    #[test]
+    fn bare_gauge_has_no_default_run() {
+        let theme = themed();
+        let line = meta_line("██", &theme);
+        assert_eq!(parts(&line), vec![("██".to_string(), Some(FILL))]);
+    }
 }
 
 #[cfg(test)]

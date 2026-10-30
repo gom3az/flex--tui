@@ -86,10 +86,137 @@ pub struct Theme {
     pub filter_prompt: Style,
     /// Filter placeholder + hint line.
     pub hint: Style,
-    /// Gauge fill (the volume-gauge widget).
+    /// Gauge fill (the volume-gauge widget, and the `█` cells of a text gauge
+    /// baked into `Row::meta`).
     pub gauge_fill: Style,
+    /// Gauge trough (the `░` cells of a text gauge in `Row::meta`).
+    pub gauge_empty: Style,
     /// Offline rows/menus (`— offline`), dimmed like the old flex UI.
     pub offline: Style,
+}
+
+/// Semantic color roles from the Material 3 design system.
+///
+/// UI elements declare intent through semantic roles (e.g. `Primary`,
+/// `OnPrimary`, `SurfaceContainer`, `Outline`) rather than arbitrary vendor
+/// color names, guaranteeing consistent hierarchy and contrast across any theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ColorRole {
+    /// Primary accent for focus, active tab, and filter cursor.
+    Primary,
+    /// High-contrast foreground against [`Self::Primary`].
+    OnPrimary,
+    /// Secondary accent for active states and indicators.
+    Secondary,
+    /// High-contrast foreground against [`Self::Secondary`].
+    OnSecondary,
+    /// Tertiary accent for data gauges and quantitative metrics.
+    Tertiary,
+    /// High-contrast foreground against [`Self::Tertiary`].
+    OnTertiary,
+    /// Base background surface.
+    Surface,
+    /// Elevated card or container surface (e.g. toasts, modals).
+    SurfaceContainer,
+    /// High-contrast text on surfaces (labels, row titles).
+    OnSurface,
+    /// Subdued text on surfaces (hints, offline indicators, secondary meta).
+    OnSurfaceVariant,
+    /// Structural borders for dropdowns, popups and dividers.
+    Outline,
+    /// Subtle boundaries, gauge troughs, and inactive meters.
+    OutlineVariant,
+    /// Error, overload, or critical urgency.
+    Error,
+    /// High-contrast text on [`Self::Error`].
+    OnError,
+}
+
+/// A complete Material 3 semantic color scheme for the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColorScheme {
+    pub primary: Color,
+    pub on_primary: Color,
+    pub secondary: Color,
+    pub on_secondary: Color,
+    pub tertiary: Color,
+    pub on_tertiary: Color,
+    pub surface: Color,
+    pub surface_container: Color,
+    pub on_surface: Color,
+    pub on_surface_variant: Color,
+    pub outline: Color,
+    pub outline_variant: Color,
+    pub error: Color,
+    pub on_error: Color,
+}
+
+impl ColorScheme {
+    /// Look up a color by its semantic [`ColorRole`].
+    #[must_use]
+    pub const fn get(&self, role: ColorRole) -> Color {
+        match role {
+            ColorRole::Primary => self.primary,
+            ColorRole::OnPrimary => self.on_primary,
+            ColorRole::Secondary => self.secondary,
+            ColorRole::OnSecondary => self.on_secondary,
+            ColorRole::Tertiary => self.tertiary,
+            ColorRole::OnTertiary => self.on_tertiary,
+            ColorRole::Surface => self.surface,
+            ColorRole::SurfaceContainer => self.surface_container,
+            ColorRole::OnSurface => self.on_surface,
+            ColorRole::OnSurfaceVariant => self.on_surface_variant,
+            ColorRole::Outline => self.outline,
+            ColorRole::OutlineVariant => self.outline_variant,
+            ColorRole::Error => self.error,
+            ColorRole::OnError => self.on_error,
+        }
+    }
+
+    /// Convert this semantic color scheme into engine [`Theme`] styles.
+    #[must_use]
+    pub fn to_theme(&self) -> Theme {
+        let mut theme = Theme::DEFAULT;
+
+        // Core accents: primary drives focus and selection
+        theme.selector = Style::new().fg(self.primary);
+        theme.tab_selected = Style::new().fg(self.primary);
+        theme.tab_marker = Style::new().fg(self.primary);
+        theme.filter_prompt = Style::new().fg(self.primary);
+
+        // Selection highlight: accessible contrast pair
+        theme.dropdown_selected = Style::new().fg(self.on_primary).bg(self.primary);
+
+        // Data visualization: tertiary provides distinct visual interest from primary
+        theme.gauge_fill = Style::new().fg(self.tertiary);
+        theme.volume_filled = Style::new().fg(self.tertiary);
+
+        // Subdued chrome: outline variant for troughs and passive indicators
+        theme.gauge_empty = Style::new().fg(self.outline_variant);
+        theme.volume_empty = Style::new().fg(self.outline_variant);
+        theme.list_more = Style::new().fg(self.outline_variant);
+        theme.dropdown_more = Style::new().fg(self.outline_variant);
+        theme.help_more = Style::new().fg(self.outline_variant);
+        theme.meter_inactive = Style::new().fg(self.outline_variant);
+        theme.meter_center_inactive = Style::new().fg(self.outline_variant);
+
+        // Active state indicator
+        theme.meter_active = Style::new().fg(self.secondary);
+        theme.meter_center_active = Style::new().fg(self.secondary);
+
+        // Danger / overload: semantic error role
+        theme.meter_overload = Style::new().fg(self.error);
+
+        // Boundaries: structural outline
+        theme.dropdown_border = Style::new().fg(self.outline);
+        theme.help_border = Style::new().fg(self.outline);
+
+        // Secondary text: muted variant
+        theme.hint = Style::new().fg(self.on_surface_variant);
+        theme.offline = Style::new().fg(self.on_surface_variant);
+
+        theme
+    }
 }
 
 impl Default for Theme {
@@ -134,6 +261,7 @@ impl Theme {
         filter_prompt: Style::new().fg(Color::LightCyan),
         hint: Style::new().fg(Color::DarkGray),
         gauge_fill: Style::new().fg(Color::LightBlue),
+        gauge_empty: Style::new().fg(Color::DarkGray),
         offline: Style::new().fg(Color::DarkGray),
     };
 
@@ -170,6 +298,7 @@ impl Theme {
         filter_prompt: Style::new().add_modifier(Modifier::BOLD),
         hint: Style::new().add_modifier(Modifier::DIM),
         gauge_fill: Style::new().add_modifier(Modifier::BOLD),
+        gauge_empty: Style::new().add_modifier(Modifier::DIM),
         offline: Style::new().add_modifier(Modifier::DIM),
     };
 
@@ -206,6 +335,7 @@ impl Theme {
         filter_prompt: Style::new(),
         hint: Style::new(),
         gauge_fill: Style::new(),
+        gauge_empty: Style::new(),
         offline: Style::new(),
     };
 
